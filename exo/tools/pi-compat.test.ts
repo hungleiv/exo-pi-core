@@ -1,9 +1,17 @@
 import { fileURLToPath } from "node:url";
+import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import { HarnessToolRegistry, type TurnContext } from "@exo/harness";
 import { describe, expect, it } from "vitest";
 
-import { loadPiExtension, toStrictParameters } from "./pi-compat";
+import {
+  loadPiExtension,
+  piExtensionModuleUrl,
+  piExtensionPathsFromEnv,
+  toStrictParameters,
+} from "./pi-compat";
 import type { JsonObject } from "@exo/harness";
 
 const fixturePath = fileURLToPath(
@@ -49,6 +57,7 @@ describe("pi-compat strict parameters", () => {
 describe("loadPiExtension", () => {
   it("registers tools as library tools and reports unsupported events", async () => {
     const loaded = await loadPiExtension(registry(), fixturePath, {
+      cacheBust: false,
       route: "sandbox",
       cwd: "/work",
     });
@@ -61,19 +70,32 @@ describe("loadPiExtension", () => {
 
   it("executes converted tools with route context", async () => {
     const tools = registry();
-    await loadPiExtension(tools, fixturePath, { route: "sandbox", cwd: "/work" });
+    await loadPiExtension(tools, fixturePath, {
+      cacheBust: false,
+      route: "sandbox",
+      cwd: "/work",
+    });
 
-    const result = (await tools.get("shout")?.handler.execute(
-      { text: "hey", loud: true },
-      { context: {} as TurnContext },
-    )) as JsonObject;
+    const result = (await tools
+      .get("shout")
+      ?.handler.execute(
+        { text: "hey", loud: true },
+        { context: {} as TurnContext },
+      )) as JsonObject;
 
-    expect(result).toMatchObject({ ok: true, text: "HEY!!!", route: "sandbox" });
+    expect(result).toMatchObject({
+      ok: true,
+      text: "HEY!!!",
+      route: "sandbox",
+    });
   });
 
   it("exposes commands through one dispatcher tool when asked", async () => {
     const tools = registry();
-    const loaded = await loadPiExtension(tools, fixturePath, { exposeCommands: true });
+    const loaded = await loadPiExtension(tools, fixturePath, {
+      cacheBust: false,
+      exposeCommands: true,
+    });
 
     expect(loaded.tools.map((tool) => tool.definition.name).sort()).toEqual([
       "sample-pi-extension_command",
@@ -82,14 +104,42 @@ describe("loadPiExtension", () => {
 
     const result = (await tools
       .get("sample-pi-extension_command")
-      ?.handler.execute({ command: "greet", args: "exo" }, { context: {} as TurnContext })) as JsonObject;
+      ?.handler.execute(
+        { command: "greet", args: "exo" },
+        { context: {} as TurnContext },
+      )) as JsonObject;
 
     expect(result).toMatchObject({ ok: true, text: "hello exo" });
   });
 
   it("rejects extensions without a default export", async () => {
-    await expect(loadPiExtension(registry(), import.meta.filename)).rejects.toThrow(
-      /no default export/,
-    );
+    await expect(
+      loadPiExtension(registry(), import.meta.filename, { cacheBust: false }),
+    ).rejects.toThrow(/no default export/);
+  });
+
+  it("changes the module URL when the file changes", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pi-reload-"));
+    const extensionPath = path.join(dir, "ext.ts");
+    writeFileSync(extensionPath, "export default function() {}");
+
+    const before = piExtensionModuleUrl(extensionPath);
+    const later = new Date(Date.now() + 2000);
+    utimesSync(extensionPath, later, later);
+    const after = piExtensionModuleUrl(extensionPath);
+
+    expect(before).not.toBe(after);
+    expect(piExtensionModuleUrl(extensionPath, false)).not.toContain("?v=");
+  });
+});
+
+describe("piExtensionPathsFromEnv", () => {
+  it("returns empty when unset and splits comma lists", () => {
+    expect(piExtensionPathsFromEnv({} as NodeJS.ProcessEnv)).toEqual([]);
+    expect(
+      piExtensionPathsFromEnv({
+        EXO_PI_EXTENSIONS: " a.ts ,b.ts,, ",
+      } as NodeJS.ProcessEnv),
+    ).toEqual(["a.ts", "b.ts"]);
   });
 });

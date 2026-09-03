@@ -8,6 +8,7 @@ import {
 import { registerGuardianTools } from "../tools/guardian-tools";
 import { registerIntrospectionTools } from "../tools/introspection-tools";
 import { registerMemoryTools } from "../tools/memory-tools";
+import { loadPiExtension, piExtensionPathsFromEnv } from "../tools/pi-compat";
 import { registerSandboxTools } from "../tools/sandbox-tools";
 import { registerSchedulerTools } from "../tools/scheduler-tools";
 import { registerTodoTools } from "../tools/todo-tools";
@@ -23,7 +24,7 @@ export const practicalProfile: ExoProfile = {
     }
     return names;
   },
-  registerTools(tools, context) {
+  async registerTools(tools, context) {
     const libraryTools = new HarnessToolRegistry(context);
     registerSchedulerTools(libraryTools);
     registerAdapterTools(libraryTools);
@@ -33,6 +34,14 @@ export const practicalProfile: ExoProfile = {
     registerTodoTools(libraryTools);
     registerSkillTools(libraryTools);
     registerWebTools(libraryTools);
+    // Pi-style extensions from EXO_PI_EXTENSIONS (comma-separated paths).
+    // Unset means nothing extra. The registry is rebuilt every tool
+    // round-trip, so edited extensions reload on the next turn.
+    for (const extensionPath of piExtensionPathsFromEnv()) {
+      await loadPiExtension(libraryTools, extensionPath, {
+        exposeCommands: true,
+      });
+    }
     for (const tool of libraryTools.instances()) {
       tools.register({ ...tool, source: "library" });
     }

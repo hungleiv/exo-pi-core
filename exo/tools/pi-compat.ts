@@ -26,6 +26,7 @@
 // execute function. It does not sandbox the JS itself; JS sandboxing in
 // Exo goes through the shell/sandbox tool boundary.
 
+import { statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -49,7 +50,10 @@ export interface PiToolDefinition {
   name: string;
   description: string;
   parameters?: JsonValue;
-  execute: (args: JsonObject, ctx: PiToolContext) => Promise<JsonValue> | JsonValue;
+  execute: (
+    args: JsonObject,
+    ctx: PiToolContext,
+  ) => Promise<JsonValue> | JsonValue;
 }
 
 export interface PiCommandDefinition {
@@ -71,14 +75,15 @@ export interface PiExtensionApi {
   on: (event: string, listener: PiToolCallListener) => void;
 }
 
-export type PiExtensionModule = (
-  api: PiExtensionApi,
-) => void | Promise<void>;
+export type PiExtensionModule = (api: PiExtensionApi) => void | Promise<void>;
 
 export interface LoadPiExtensionOptions {
   route?: PiToolRoute;
   cwd?: string;
   exposeCommands?: boolean;
+  // Append ?v=<mtime> so edited files reload on the next turn. Disable in
+  // test runners whose transform pipeline cannot handle query imports.
+  cacheBust?: boolean;
 }
 
 export interface LoadedPiExtension {
@@ -88,11 +93,42 @@ export interface LoadedPiExtension {
   unsupportedEvents: string[];
 }
 
+// Read EXO_PI_EXTENSIONS (comma-separated extension file paths). Empty or
+// unset means no pi extensions; the profile registers nothing extra.
+export function piExtensionPathsFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
+  const raw = env.EXO_PI_EXTENSIONS ?? "";
+  return raw
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
 const SUPPORTED_EVENTS = new Set(["tool_call"]);
+
+// Build the module URL for an extension file. With cache busting, the file
+// mtime rides in a query string so the ESM loader treats each saved version
+// as a new module (verified under tsx; vitest's transform pipeline cannot
+// handle query imports, so tests disable it).
+export function piExtensionModuleUrl(
+  extensionPath: string,
+  cacheBust = true,
+): string {
+  const base = pathToFileURL(extensionPath).href;
+  if (!cacheBust) {
+    return base;
+  }
+  const mtimeMs =
+    statSync(extensionPath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
+  return `${base}?v=${mtimeMs}`;
+}
 
 function extensionNameFromPath(extensionPath: string): string {
   const base = path.basename(extensionPath).replace(/\.[^.]+$/, "");
-  return base.replace(/[^A-Za-z0-9_.-]+/g, "_") || `ext_${randomUUID().slice(0, 8)}`;
+  return (
+    base.replace(/[^A-Za-z0-9_.-]+/g, "_") || `ext_${randomUUID().slice(0, 8)}`
+  );
 }
 
 function isRecord(value: JsonValue | unknown): value is JsonObject {
@@ -102,7 +138,9 @@ function isRecord(value: JsonValue | unknown): value is JsonObject {
 // Normalize a pi-style JSON Schema object into the strict-mode shape Exo
 // tool definitions use: no additional properties, every declared property
 // key listed in required, optionals expressed as nullable.
-export function toStrictParameters(parameters: JsonValue | undefined): JsonObject {
+export function toStrictParameters(
+  parameters: JsonValue | undefined,
+): JsonObject {
   if (!isRecord(parameters)) {
     return {
       type: "object",
@@ -172,9 +210,14 @@ export async function loadPiExtension(
     },
   };
 
-  const module = (await import(
-    pathToFileURL(extensionPath).href
-  )) as unknown as { default?: unknown };
+  // Cache-bust by mtime so editing an extension file takes effect on the
+  // next turn without restarting the harness (pi's /reload semantics; the
+  // registry is rebuilt every tool round-trip).
+  const moduleUrl = piExtensionModuleUrl(
+    extensionPath,
+    options.cacheBust ?? true,
+  );
+  const module = (await import(moduleUrl)) as unknown as { default?: unknown };
   if (typeof module.default !== "function") {
     throw new Error(`pi extension has no default export: ${extensionPath}`);
   }
@@ -252,7 +295,10 @@ function toCommandDispatcher(
       async execute(args) {
         const commandName = args.command;
         if (typeof commandName !== "string" || !byName.has(commandName)) {
-          return { ok: false, error: `unknown command: ${String(commandName)}` };
+          return {
+            ok: false,
+            error: `unknown command: ${String(commandName)}`,
+          };
         }
         const rawArgs = typeof args.args === "string" ? args.args : "";
         const result = await byName.get(commandName)?.execute(rawArgs, ctx);
