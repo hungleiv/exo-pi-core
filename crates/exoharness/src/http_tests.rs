@@ -10,23 +10,25 @@ use tempfile::TempDir;
 use crate::test_support::local_test_config;
 use crate::{
     BasicExoHarness, BeginTurnRequest, CreateSandboxRequest, EventData, EventKind, EventQuery,
-    EventQueryDirection, ExoHarness, HttpExoHarness, ManagedSandboxBackend, ManagedSandboxHandle,
-    RestoreSandboxRequest, RunInSandboxRequest, SandboxAttachment, SandboxCommand,
-    SandboxCommandOutput, SandboxProcessEvent, SandboxProcessEventQuery, SandboxProcessParts,
-    SandboxProcessStatus, SandboxProcessStdin, SandboxProvider, SandboxRequest, SnapshotFormat,
-    SnapshotPayload, StartSandboxProcessRequest, StartSandboxRequest, WaitSandboxProcessRequest,
-    WriteSandboxProcessInputRequest, serve_exoharness_http_listener,
+    EventQueryDirection, ExoHarness, ExoHarnessHttpServeOptions, HttpExoHarness,
+    ManagedSandboxBackend, ManagedSandboxHandle, RestoreSandboxRequest, RunInSandboxRequest,
+    SandboxAttachment, SandboxCommand, SandboxCommandOutput, SandboxProcessEvent,
+    SandboxProcessEventQuery, SandboxProcessParts, SandboxProcessStatus, SandboxProcessStdin,
+    SandboxProvider, SandboxRequest, SnapshotFormat, SnapshotPayload, StartSandboxProcessRequest,
+    StartSandboxRequest, WaitSandboxProcessRequest, WriteSandboxProcessInputRequest,
+    bind_exoharness_http_listener,
 };
 
 struct HttpHarnessFixture {
     harness: Arc<dyn ExoHarness>,
-    server: actix_web::rt::task::JoinHandle<crate::Result<()>>,
+    server_handle: actix_web::dev::ServerHandle,
+    _server_task: actix_web::rt::task::JoinHandle<std::io::Result<()>>,
     _tempdir: TempDir,
 }
 
-impl Drop for HttpHarnessFixture {
-    fn drop(&mut self) {
-        self.server.abort();
+impl HttpHarnessFixture {
+    async fn shutdown(&self) {
+        self.server_handle.stop(false).await;
     }
 }
 
@@ -37,13 +39,21 @@ async fn http_harness() -> HttpHarnessFixture {
         .expect("basic harness");
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let addr = listener.local_addr().expect("local addr");
-    let server = actix_web::rt::spawn(serve_exoharness_http_listener(listener, Arc::new(basic)));
+    let server = bind_exoharness_http_listener(
+        listener,
+        Arc::new(basic),
+        ExoHarnessHttpServeOptions::default(),
+    )
+    .expect("bind listener");
+    let server_handle = server.handle();
+    let server_task = actix_web::rt::spawn(server);
     let harness: Arc<dyn ExoHarness> =
         Arc::new(HttpExoHarness::new(format!("http://{addr}")).expect("http harness"));
 
     HttpHarnessFixture {
         harness,
-        server,
+        server_handle,
+        _server_task: server_task,
         _tempdir: tempdir,
     }
 }
@@ -58,13 +68,21 @@ async fn http_harness_with_sandbox_backend(
             .expect("basic harness");
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("listener");
     let addr = listener.local_addr().expect("local addr");
-    let server = actix_web::rt::spawn(serve_exoharness_http_listener(listener, Arc::new(basic)));
+    let server = bind_exoharness_http_listener(
+        listener,
+        Arc::new(basic),
+        ExoHarnessHttpServeOptions::default(),
+    )
+    .expect("bind listener");
+    let server_handle = server.handle();
+    let server_task = actix_web::rt::spawn(server);
     let harness: Arc<dyn ExoHarness> =
         Arc::new(HttpExoHarness::new(format!("http://{addr}")).expect("http harness"));
 
     HttpHarnessFixture {
         harness,
-        server,
+        server_handle,
+        _server_task: server_task,
         _tempdir: tempdir,
     }
 }
@@ -73,6 +91,7 @@ async fn http_harness_with_sandbox_backend(
 async fn http_exoharness_supports_agent_and_conversation_crud() {
     let fixture = http_harness().await;
     crate::contract_tests::supports_agent_and_conversation_crud(Arc::clone(&fixture.harness)).await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -82,6 +101,7 @@ async fn http_exoharness_supports_thread_and_conversation_apis() {
         &fixture.harness,
     ))
     .await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -91,6 +111,7 @@ async fn http_exoharness_lists_conversations_recent_first_and_paginates() {
         &fixture.harness,
     ))
     .await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -98,6 +119,7 @@ async fn http_exoharness_begin_turn_tracks_events_through_finish() {
     let fixture = http_harness().await;
     crate::contract_tests::begin_turn_tracks_events_through_finish(Arc::clone(&fixture.harness))
         .await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -105,6 +127,7 @@ async fn http_exoharness_turn_events_continue_after_artifact_writes() {
     let fixture = http_harness().await;
     crate::contract_tests::turn_events_continue_after_artifact_writes(Arc::clone(&fixture.harness))
         .await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -114,6 +137,7 @@ async fn http_exoharness_conversation_scope_overrides_and_forks() {
         Arc::clone(&fixture.harness),
     )
     .await;
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -176,6 +200,7 @@ async fn http_exoharness_runs_noninteractive_sandbox_commands() {
     stdout.read_to_end(&mut output).await.expect("stdout");
     assert_eq!(output, b"hello");
     assert_eq!(parts.wait.await.expect("exit"), 0);
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -248,6 +273,7 @@ async fn http_exoharness_runs_agent_scoped_sandbox_commands() {
         })
         .await;
     assert!(conversation_process.is_err());
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -336,6 +362,7 @@ async fn http_exoharness_supports_sandbox_process_events() {
         events.events.last(),
         Some(SandboxProcessEvent::Exit { exit_code: 0, .. })
     ));
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -428,6 +455,7 @@ async fn http_exoharness_supports_turn_scoped_sandbox_snapshot_and_start() {
         Some(turn.record().session_id)
     );
     assert_eq!(restored_start_event.turn_id, Some(turn.record().id));
+    fixture.shutdown().await;
 }
 
 #[actix_web::test]
@@ -503,6 +531,7 @@ async fn http_exoharness_restores_a_snapshot_into_a_new_sandbox() {
             } if sandbox_id == &target_id && event_snapshot_id == &snapshot_id
         )
     }));
+    fixture.shutdown().await;
 }
 
 struct SnapshotTestSandboxBackend;

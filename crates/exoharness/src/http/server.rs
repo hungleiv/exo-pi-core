@@ -49,11 +49,24 @@ pub async fn serve_exoharness_http_listener_with_options(
     root: Arc<dyn ExoHarness>,
     options: ExoHarnessHttpServeOptions,
 ) -> Result<()> {
+    bind_exoharness_http_listener(listener, root, options)?.await?;
+    Ok(())
+}
+
+/// Build the HTTP server without running it, so tests can hold the
+/// [`actix_web::dev::ServerHandle`] and shut workers down explicitly.
+/// Aborting the server future leaks worker threads (EMFILE under
+/// `#[actix_web::test]`); callers must `handle.stop(false).await`.
+pub fn bind_exoharness_http_listener(
+    listener: TcpListener,
+    root: Arc<dyn ExoHarness>,
+    options: ExoHarnessHttpServeOptions,
+) -> Result<actix_web::dev::Server> {
     let state = Arc::new(HttpServerState {
         server: Arc::new(ExoHarnessServer::new(root)),
         options,
     });
-    HttpServer::new(move || {
+    let server = HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(Arc::clone(&state)))
             .route("/health", web::get().to(health))
@@ -62,10 +75,10 @@ pub async fn serve_exoharness_http_listener_with_options(
                 web::post().to(handle_http_request),
             )
     })
+    .workers(2)
     .listen(listener)?
-    .run()
-    .await?;
-    Ok(())
+    .run();
+    Ok(server)
 }
 
 async fn health() -> impl Responder {

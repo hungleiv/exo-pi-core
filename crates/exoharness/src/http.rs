@@ -4,8 +4,9 @@ mod server;
 
 pub use client::HttpExoHarness;
 pub use server::{
-    ExoHarnessHttpServeOptions, serve_exoharness_http, serve_exoharness_http_listener,
-    serve_exoharness_http_listener_with_options, serve_exoharness_http_with_options,
+    ExoHarnessHttpServeOptions, bind_exoharness_http_listener, serve_exoharness_http,
+    serve_exoharness_http_listener, serve_exoharness_http_listener_with_options,
+    serve_exoharness_http_with_options,
 };
 
 pub const HTTP_EXOHARNESS_REQUEST_PATH: &str = "/request";
