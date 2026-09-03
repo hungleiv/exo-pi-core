@@ -241,12 +241,21 @@ fn resolve_openai_config(
         .clone()
         .or_else(|| optional_env(env, "OPENAI_API_KEY"))
         .ok_or_else(|| anyhow::anyhow!("model request is missing an API key"))?;
-    let endpoint = request
+    let raw_base_url = request
         .base_url
         .clone()
-        .or_else(|| optional_env(env, "OPENAI_BASE_URL"))
+        .or_else(|| optional_env(env, "OPENAI_BASE_URL"));
+    let endpoint = raw_base_url
+        .clone()
         .map(|raw| Url::parse(&raw))
         .transpose()?;
+    // Only OpenAI's own endpoint speaks the Responses API. Any custom
+    // OpenAI-compatible base URL (proxies, gateways like opencode zen,
+    // local servers) gets Chat Completions, which is the widely supported
+    // wire format.
+    let custom_base_url = raw_base_url
+        .as_deref()
+        .is_some_and(|url| !url.contains("api.openai.com"));
     let mut metadata = HashMap::new();
     if let Some(organization_id) = optional_env(env, "OPENAI_ORG_ID") {
         metadata.insert(
@@ -258,9 +267,17 @@ fn resolve_openai_config(
         metadata.insert("project".to_string(), lingua_json::Value::String(project));
     }
     Ok(ResolvedRuntimeConfig {
-        provider_alias: "openai".to_string(),
+        provider_alias: if custom_base_url {
+            "openai-compatible".to_string()
+        } else {
+            "openai".to_string()
+        },
         provider_kind: "openai".to_string(),
-        format: ProviderFormat::Responses,
+        format: if custom_base_url {
+            ProviderFormat::ChatCompletions
+        } else {
+            ProviderFormat::Responses
+        },
         endpoint,
         endpoint_template: None,
         metadata,
@@ -446,6 +463,31 @@ mod tests {
         let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
 
         assert_eq!(config.provider_kind, "openai");
+        assert_eq!(config.format, ProviderFormat::Responses);
+    }
+
+    #[test]
+    fn custom_openai_compatible_base_urls_use_chat_completions() {
+        let mut request = model_request();
+        request.api_key = Some("sk-test".to_string());
+        request.base_url = Some("https://opencode.ai/zen/go/v1".to_string());
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_alias, "openai-compatible");
+        assert_eq!(config.provider_kind, "openai");
+        assert_eq!(config.format, ProviderFormat::ChatCompletions);
+    }
+
+    #[test]
+    fn explicit_openai_endpoint_keeps_the_responses_route() {
+        let mut request = model_request();
+        request.api_key = Some("sk-test".to_string());
+        request.base_url = Some("https://api.openai.com/v1".to_string());
+
+        let config = resolve_runtime_config(&request, &HashMap::new()).unwrap();
+
+        assert_eq!(config.provider_alias, "openai");
         assert_eq!(config.format, ProviderFormat::Responses);
     }
 
