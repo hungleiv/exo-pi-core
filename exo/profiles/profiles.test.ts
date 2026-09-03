@@ -29,7 +29,7 @@ describe("Exo profiles", () => {
     ]);
   });
 
-  it("keeps practical extensions classified as library tools", () => {
+  it("keeps practical extensions classified as library tools", async () => {
     const profile = resolveExoProfile("practical");
     const context = {
       agentConfig: { enableAgentToolCreation: false },
@@ -40,12 +40,15 @@ describe("Exo profiles", () => {
       "inspect_tools",
       "manage_tool",
     ]);
-    profile.registerTools(tools, context);
+    await profile.registerTools(tools, context);
 
-    expect(tools.get("create_adapter")?.source).toBe("library");
-    expect(tools.get("snapshot_sandbox")?.source).toBe("library");
-    expect(tools.get("web_search")?.source).toBe("library");
+    // Core evolution tools stay profile-owned (host tools report source
+    // built_in); the optional toolsets load as pi extensions
+    // (EXO_PI_EXTENSIONS_BUNDLED in real runs, unset here).
+    expect(tools.get("snapshot_sandbox")?.source).toBe("built_in");
     expect(tools.get("rebuild_and_restart_exo")?.source).toBe("built_in");
+    expect(tools.get("web_search")).toBeUndefined();
+    expect(tools.get("create_adapter")).toBeUndefined();
     expect([
       ...profile.builtInToolNames(context),
       ...tools
@@ -56,8 +59,32 @@ describe("Exo profiles", () => {
       "shell",
       "inspect_tools",
       "manage_tool",
+      "get_sandbox_status",
+      "list_sandbox_snapshots",
+      "snapshot_sandbox",
+      "rewind_sandbox",
       "rebuild_and_restart_exo",
     ]);
+  });
+
+  it("loads bundled toolset extensions through the pi loader", async () => {
+    const profile = resolveExoProfile("practical");
+    const context = {
+      agentConfig: { enableAgentToolCreation: false },
+    } as TurnContext;
+    const tools = new HarnessToolRegistry(context);
+    process.env.EXO_PI_EXTENSIONS_BUNDLED =
+      "web-tools-extension.ts,todo-tools-extension.ts";
+    try {
+      await profile.registerTools(tools, context);
+      expect(tools.get("web_search")?.source).toBe("library");
+      expect(tools.get("web_fetch")?.source).toBe("library");
+      expect(tools.get("todowrite")?.source).toBe("library");
+      // Extension loading must not break the core toolsets.
+      expect(tools.get("snapshot_sandbox")?.source).toBe("built_in");
+    } finally {
+      delete process.env.EXO_PI_EXTENSIONS_BUNDLED;
+    }
   });
 
   it("exposes legacy agent-tool creation only when enabled", () => {

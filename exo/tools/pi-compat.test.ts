@@ -142,4 +142,80 @@ describe("piExtensionPathsFromEnv", () => {
       } as NodeJS.ProcessEnv),
     ).toEqual(["a.ts", "b.ts"]);
   });
+
+  it("resolves bundled names against the given prefix", () => {
+    const paths = piExtensionPathsFromEnv(
+      {
+        EXO_PI_EXTENSIONS_BUNDLED: "web-tools-extension.ts, ../x.ts",
+      } as NodeJS.ProcessEnv,
+      { bundledPrefix: "./extensions" },
+    );
+    // Both entries resolve relative to this module's directory (exo/tools/).
+    expect(paths[0]).toBe(
+      path.join(
+        path.dirname(fileURLToPath(import.meta.url)),
+        "extensions",
+        "web-tools-extension.ts",
+      ),
+    );
+    expect(paths[1]).toBe(
+      path.join(path.dirname(fileURLToPath(import.meta.url)), "x.ts"),
+    );
+    // Absolute entries pass through untouched.
+    expect(
+      piExtensionPathsFromEnv(
+        { EXO_PI_EXTENSIONS_BUNDLED: "/tmp/ext.ts" } as NodeJS.ProcessEnv,
+        { bundledPrefix: "./extensions" },
+      ),
+    ).toEqual(["/tmp/ext.ts"]);
+  });
+});
+
+describe("registerToolInstance", () => {
+  it("registers a native ToolInstance with execution passthrough", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pi-native-"));
+    const extensionPath = path.join(dir, "native.ts");
+    writeFileSync(
+      extensionPath,
+      `
+      export default function (pi) {
+        pi.seen = pi.seen || [];
+        pi.on("tool_call", (event) => pi.seen.push(event.toolName));
+        pi.registerToolInstance({
+          source: "library",
+          definition: {
+            name: "native_echo",
+            description: "echo",
+            parameters: { type: "object", additionalProperties: false, properties: { text: { type: "string" } }, required: ["text"] },
+          },
+          handler: {
+            async execute(args, execution) {
+              pi.gotExecution = execution !== undefined && execution.context !== undefined;
+              return { ok: true, text: args.text, contextSeen: pi.gotExecution };
+            },
+          },
+        });
+      }
+      `,
+    );
+
+    const tools = registry();
+    const loaded = await loadPiExtension(tools, extensionPath, {
+      cacheBust: false,
+    });
+    expect(loaded.tools.map((tool) => tool.definition.name)).toEqual([
+      "native_echo",
+    ]);
+
+    const result = (await tools
+      .get("native_echo")
+      ?.handler.execute(
+        { text: "hi" },
+        { context: {} as TurnContext },
+      )) as JsonObject;
+    // The native handler received the full execution (context passthrough)
+    // and the tool_call listener fired.
+    expect(result).toMatchObject({ ok: true, contextSeen: true });
+    expect(loaded.unsupportedEvents).toEqual([]);
+  });
 });

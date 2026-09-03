@@ -29,7 +29,7 @@
 import { statSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import type {
   HarnessToolRegistry,
@@ -70,6 +70,11 @@ export type PiToolCallListener = (event: {
 export interface PiExtensionApi {
   registerTool: (tool: PiToolDefinition) => void;
   registerCommand: (command: PiCommandDefinition) => void;
+  // Register an already-complete Exo ToolInstance (definition + handler with
+  // the native `execute(args, execution)` signature). Lets an extension wrap
+  // existing exo toolsets — execution flows through unchanged, so handlers
+  // keep their access to the TurnContext.
+  registerToolInstance: (tool: ToolInstance) => void;
   getActiveTools: () => string[];
   setActiveTools: (names: string[]) => void;
   on: (event: string, listener: PiToolCallListener) => void;
@@ -93,16 +98,48 @@ export interface LoadedPiExtension {
   unsupportedEvents: string[];
 }
 
-// Read EXO_PI_EXTENSIONS (comma-separated extension file paths). Empty or
-// unset means no pi extensions; the profile registers nothing extra.
+// Read EXO_PI_EXTENSIONS (comma-separated extension file paths) plus
+// EXO_PI_EXTENSIONS_BUNDLED (comma-separated file names resolved against
+// this module's ../extensions directory). Empty or unset means no pi
+// extensions; the profile registers nothing extra.
+export interface PiExtensionPathsOptions {
+  // Resolve EXO_PI_EXTENSIONS_BUNDLED entries against this directory,
+  // interpreted relative to this module's own directory. Entries starting
+  // with "/" are treated as absolute. Use EXO_PI_EXTENSIONS for arbitrary
+  // paths.
+  bundledPrefix?: string;
+}
+
 export function piExtensionPathsFromEnv(
   env: NodeJS.ProcessEnv = process.env,
+  options: PiExtensionPathsOptions = {},
 ): string[] {
   const raw = env.EXO_PI_EXTENSIONS ?? "";
+  const bundledRaw = env.EXO_PI_EXTENSIONS_BUNDLED ?? "";
+  const prefix = options.bundledPrefix;
+  return [
+    ...splitCommaList(raw),
+    ...splitCommaList(bundledRaw).map((entry) =>
+      prefix && !path.isAbsolute(entry)
+        ? joinExtensionPath(prefix, entry)
+        : entry,
+    ),
+  ];
+}
+
+function splitCommaList(raw: string): string[] {
   return raw
     .split(",")
     .map((entry) => entry.trim())
     .filter((entry) => entry.length > 0);
+}
+
+// Resolve `prefix/entry` against the directory of this module, so a caller
+// passing bundledPrefix "../tools/extensions" + entry "web-tools-extension.ts"
+// gets <this module dir>/../tools/extensions/web-tools-extension.ts.
+function joinExtensionPath(prefix: string, entry: string): string {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  return path.resolve(here, prefix, entry);
 }
 
 const SUPPORTED_EVENTS = new Set(["tool_call"]);
@@ -186,6 +223,7 @@ export async function loadPiExtension(
 
   const tools: PiToolDefinition[] = [];
   const commands: PiCommandDefinition[] = [];
+  const toolInstances: ToolInstance[] = [];
   const toolCallListeners: PiToolCallListener[] = [];
   const unsupportedEvents: string[] = [];
   let activeTools: string[] | null = null;
@@ -197,7 +235,14 @@ export async function loadPiExtension(
     registerCommand: (command) => {
       commands.push(command);
     },
-    getActiveTools: () => activeTools ?? tools.map((tool) => tool.name),
+    registerToolInstance: (tool) => {
+      toolInstances.push(tool);
+    },
+    getActiveTools: () =>
+      activeTools ?? [
+        ...tools.map((tool) => tool.name),
+        ...toolInstances.map((tool) => tool.definition.name),
+      ],
     setActiveTools: (names) => {
       activeTools = [...names];
     },
@@ -212,10 +257,11 @@ export async function loadPiExtension(
 
   // Cache-bust by mtime so editing an extension file takes effect on the
   // next turn without restarting the harness (pi's /reload semantics; the
-  // registry is rebuilt every tool round-trip).
+  // registry is rebuilt every tool round-trip). Auto-disabled under vitest,
+  // whose transform pipeline cannot handle query imports.
   const moduleUrl = piExtensionModuleUrl(
     extensionPath,
-    options.cacheBust ?? true,
+    options.cacheBust ?? process.env.VITEST === undefined,
   );
   const module = (await import(moduleUrl)) as unknown as { default?: unknown };
   if (typeof module.default !== "function") {
@@ -226,6 +272,13 @@ export async function loadPiExtension(
   const ctx: PiToolContext = { route, cwd, extensionName: name };
   const instances: ToolInstance[] = tools.map((tool) =>
     toToolInstance(tool, ctx, toolCallListeners),
+  );
+  // Pre-built instances keep their native handler; tool_call listeners wrap
+  // them the same way so extensions can observe every converted tool.
+  instances.push(
+    ...toolInstances.map((tool) =>
+      wrapToolInstanceListeners(tool, toolCallListeners),
+    ),
   );
 
   if (options.exposeCommands && commands.length > 0) {
@@ -258,6 +311,32 @@ function toToolInstance(
         }
         const result = await tool.execute(args, ctx);
         return result as JsonValue;
+      },
+    },
+  };
+}
+
+// Wrap a native ToolInstance's handler so tool_call listeners fire for it
+// too, while passing `execution` (and its TurnContext) through untouched.
+// Instances arriving through an extension are classified as library tools
+// regardless of the source the original toolset declared.
+function wrapToolInstanceListeners(
+  tool: ToolInstance,
+  listeners: PiToolCallListener[],
+): ToolInstance {
+  const inner = tool.handler;
+  if (listeners.length === 0) {
+    return { ...tool, source: "library" };
+  }
+  return {
+    ...tool,
+    source: "library",
+    handler: {
+      async execute(args, execution) {
+        for (const listener of listeners) {
+          listener({ toolName: tool.definition.name, args });
+        }
+        return inner.execute(args, execution);
       },
     },
   };
