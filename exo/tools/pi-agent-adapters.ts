@@ -45,6 +45,8 @@
 import type {
   AgentTool,
   AgentToolResult,
+  BeforeToolCallContext,
+  BeforeToolCallResult,
   StreamFn,
 } from "@earendil-works/pi-agent-core";
 import {
@@ -141,6 +143,63 @@ function stringifyToolResult(result: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// beforeToolCall guardrail: blocks shell commands that write to obviously
+// protected paths. Same defaults and intent as pi-coding-agent's own
+// protected-paths.ts extension (~/.pi/agent/extensions/protected-paths.ts)
+// - block outright, headless-safe, no prompt - adapted for Exo's single
+// "shell" tool (a raw command string) instead of Pi's separate write/edit
+// tools (a structured path argument), so this matches on the command text
+// rather than a dedicated path field. A text match is inherently looser
+// than a real path argument (it can't tell "rm .env.example" from
+// "rm .env", for one) - conservative on purpose, since a false positive
+// just costs the model one blocked attempt while a false negative costs a
+// real file.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_PROTECTED_PATHS = [
+  ".env",
+  ".git/",
+  "node_modules/",
+  "__pycache__/",
+];
+
+// Only block commands that look like they *write* - a bare `cat .env` or
+// `grep foo .git/config` is a read, not something this guardrail is for.
+const WRITE_LOOKING_COMMAND_PATTERN =
+  /(^|[\s;&|])(>{1,2}|rm\s|mv\s|cp\s|sed\s+-i|truncate\s|tee\s|dd\s)/;
+
+export function createProtectedPathBeforeToolCallHook(
+  protectedPaths: string[] = DEFAULT_PROTECTED_PATHS,
+): (
+  context: BeforeToolCallContext,
+) => Promise<BeforeToolCallResult | undefined> {
+  return async (context) => {
+    if (context.toolCall.name !== "shell") {
+      return undefined;
+    }
+    const args = context.args;
+    const command =
+      args && typeof args === "object" && "command" in args
+        ? (args as { command: unknown }).command
+        : undefined;
+    if (
+      typeof command !== "string" ||
+      !WRITE_LOOKING_COMMAND_PATTERN.test(command)
+    ) {
+      return undefined;
+    }
+    const hit = protectedPaths.find((path) => command.includes(path));
+    if (!hit) {
+      return undefined;
+    }
+    return {
+      block: true,
+      reason: `PROTECTED-PATHS: command touches "${hit}" (protected: ${protectedPaths.join(", ")}). Pick another target.`,
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Seed conversion: Exo Message[] -> { systemPrompt, messages: PiMessage[] }
 // Used once, up front, to seed a fresh Agent's initialState before
 // Agent.continue() takes over driving the transcript itself.
@@ -234,9 +293,39 @@ export function buildModelStub(modelId: string): PiModel<PiApi> {
 // the end of the round.
 // ---------------------------------------------------------------------------
 
+// No round has a built-in timeout anywhere in this path - a genuinely
+// stuck provider connection (not just a slow one; a live 3000s run traced
+// back to OpenRouter free-tier congestion, not a hang, but nothing bounds
+// the wait either way) would block the turn indefinitely. completeStream()
+// doesn't take an AbortSignal, so this can only stop *waiting* on the
+// underlying request, not cancel it - still turns an unbounded hang into a
+// bounded one, which is what matters for the turn (and the caller) to make
+// progress.
+const DEFAULT_STREAM_TIMEOUT_MS = 120_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`model call timed out after ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      },
+    );
+  });
+}
+
 export interface CreateExoStreamFnOptions {
   onFirstChunk?: (ttftMs: number) => void | Promise<void>;
   onTextDelta?: (text: string) => void | Promise<void>;
+  timeoutMs?: number;
 }
 
 export function createExoStreamFn(
@@ -244,6 +333,7 @@ export function createExoStreamFn(
   exoModelId: string,
   options: CreateExoStreamFnOptions = {},
 ): StreamFn {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_STREAM_TIMEOUT_MS;
   return (model, context) => {
     const stream = createAssistantMessageEventStream();
     void (async () => {
@@ -264,27 +354,30 @@ export function createExoStreamFn(
         const request = piContextToNativeRequest(exoModelId, context);
         started = true;
         stream.push({ type: "start", partial: partial() });
-        const response = await runtime.completeStream(request, {
-          onFirstChunk: options.onFirstChunk,
-          onTextDelta: async (delta) => {
-            if (!textStarted) {
-              textStarted = true;
+        const response = await withTimeout(
+          runtime.completeStream(request, {
+            onFirstChunk: options.onFirstChunk,
+            onTextDelta: async (delta) => {
+              if (!textStarted) {
+                textStarted = true;
+                stream.push({
+                  type: "text_start",
+                  contentIndex: 0,
+                  partial: partial(),
+                });
+              }
+              text += delta;
               stream.push({
-                type: "text_start",
+                type: "text_delta",
                 contentIndex: 0,
+                delta,
                 partial: partial(),
               });
-            }
-            text += delta;
-            stream.push({
-              type: "text_delta",
-              contentIndex: 0,
-              delta,
-              partial: partial(),
-            });
-            await options.onTextDelta?.(delta);
-          },
-        });
+              await options.onTextDelta?.(delta);
+            },
+          }),
+          timeoutMs,
+        );
         if (textStarted) {
           stream.push({
             type: "text_end",
@@ -623,7 +716,23 @@ export function piEventToExoEvents(event: PiRecordableEvent): EventData[] {
   }
   const text = piAssistantText(event.message);
   if (!text) {
-    return [];
+    // A pure tool-call message (no text) is already recorded via
+    // tool_execution_start/end - nothing extra needed. But a genuinely
+    // empty, non-error assistant turn (no text, no tool call, stopReason
+    // "stop") would otherwise vanish with zero trace, even after every
+    // looksLikeUnfinishedTurn retry nudge also comes back empty - record it
+    // so an operator reading the event log sees why the turn ended blank.
+    const hasToolCall = event.message.content.some(
+      (part) => part.type === "toolCall",
+    );
+    if (hasToolCall) {
+      return [];
+    }
+    return [
+      messagesEvent([
+        assistantTextMessage("[turn ended: empty response from model]"),
+      ]),
+    ];
   }
   return [
     messagesEvent(
