@@ -238,7 +238,11 @@ describe("piEventToExoEvents", () => {
     expect(events).toEqual([]);
   });
 
-  it("ignores an assistant message_end with no text content", () => {
+  it("records a genuinely empty assistant message_end instead of dropping it", () => {
+    // No text, no tool call, stopReason "stop" - the shape that vanished
+    // with zero trace before this was fixed (pi-core-bench t3-fizzbuzz on
+    // 2026-09-04: 0 rounds, empty final text, nothing in the event log to
+    // explain why).
     const events = piEventToExoEvents({
       type: "message_end",
       message: {
@@ -256,6 +260,43 @@ describe("piEventToExoEvents", () => {
           cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
         },
         stopReason: "stop",
+        timestamp: Date.now(),
+      },
+    });
+    expect(events).toEqual([
+      {
+        type: "messages",
+        messages: [
+          {
+            role: "assistant",
+            content: "[turn ended: empty response from model]",
+          },
+        ],
+        response_id: undefined,
+      },
+    ]);
+  });
+
+  it("ignores a pure tool-call message_end with no text (already recorded via tool_execution_start/end)", () => {
+    const events = piEventToExoEvents({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [
+          { type: "toolCall", id: "call-1", name: "shell", arguments: {} },
+        ],
+        api: "openai-responses",
+        provider: "exo",
+        model: "gpt-5.5",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "toolUse",
         timestamp: Date.now(),
       },
     });

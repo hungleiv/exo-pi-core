@@ -33,6 +33,8 @@ const PROVIDER_KEY_VARIABLES: Record<string, string> = {
   // pi's own model registry (@earendil-works/pi-ai) has native openrouter
   // support and reads this exact variable (providers/openrouter.js).
   openrouter: "OPENROUTER_API_KEY",
+  opencode: "OPENCODE_API_KEY",
+  "opencode-go": "OPENCODE_API_KEY",
 };
 
 // exo names a model on its own; `provider/model` selects one explicitly.

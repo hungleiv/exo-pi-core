@@ -716,7 +716,23 @@ export function piEventToExoEvents(event: PiRecordableEvent): EventData[] {
   }
   const text = piAssistantText(event.message);
   if (!text) {
-    return [];
+    // A pure tool-call message (no text) is already recorded via
+    // tool_execution_start/end - nothing extra needed. But a genuinely
+    // empty, non-error assistant turn (no text, no tool call, stopReason
+    // "stop") would otherwise vanish with zero trace, even after every
+    // looksLikeUnfinishedTurn retry nudge also comes back empty - record it
+    // so an operator reading the event log sees why the turn ended blank.
+    const hasToolCall = event.message.content.some(
+      (part) => part.type === "toolCall",
+    );
+    if (hasToolCall) {
+      return [];
+    }
+    return [
+      messagesEvent([
+        assistantTextMessage("[turn ended: empty response from model]"),
+      ]),
+    ];
   }
   return [
     messagesEvent(

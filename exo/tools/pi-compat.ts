@@ -43,6 +43,7 @@ import type {
   JsonObject,
   JsonValue,
   ToolInstance,
+  ToolResult,
 } from "@exo/harness";
 
 export type PiToolRoute = "host" | "sandbox";
@@ -69,10 +70,30 @@ export interface PiCommandDefinition {
   execute: (args: string, ctx: PiToolContext) => Promise<JsonValue> | JsonValue;
 }
 
-export type PiToolCallListener = (event: {
-  toolName: string;
-  args: JsonObject;
-}) => void;
+export type PiToolCallListener = (
+  event: {
+    toolName: string;
+    args: JsonObject;
+  },
+  execution: PiListenerExecutionContext,
+) => void | PiToolCallDecision;
+
+export interface PiListenerExecutionContext {
+  // The harness TurnContext, passed through from the tool execution. Gives
+  // policy listeners the same reach as a native tool: exoharness handles,
+  // executeTool, current agent/conversation records.
+  context: unknown;
+  toolCallId?: string;
+}
+
+// A listener may return a decision instead of undefined. `block` vetoes the
+// tool call before the handler runs; `snapshotFirst` runs an arbitrary
+// async preparation (e.g. capture a sandbox snapshot) before executing.
+export interface PiToolCallDecision {
+  block?: boolean;
+  reason?: string;
+  before?: () => Promise<void>;
+}
 
 export interface PiExtensionApi {
   registerTool: (tool: PiToolDefinition) => void;
@@ -300,7 +321,9 @@ export async function loadPiExtension(
   const toolInstances: ToolInstance[] = [];
   const toolCallListeners: PiToolCallListener[] = [];
   const unsupportedEvents: string[] = [];
-  let activeTools: string[] | null = null;
+  // Held in an object so TS control-flow analysis cannot narrow it to
+  // `never` when read after the api closures may have mutated it.
+  const state: { activeTools: string[] | null } = { activeTools: null };
 
   const api: PiExtensionApi = {
     registerTool: (tool) => {
@@ -313,12 +336,12 @@ export async function loadPiExtension(
       toolInstances.push(tool);
     },
     getActiveTools: () =>
-      activeTools ?? [
+      state.activeTools ?? [
         ...tools.map((tool) => tool.name),
         ...toolInstances.map((tool) => tool.definition.name),
       ],
     setActiveTools: (names) => {
-      activeTools = [...names];
+      state.activeTools = [...names];
     },
     on: (event, listener) => {
       if (SUPPORTED_EVENTS.has(event)) {
@@ -366,11 +389,52 @@ export async function loadPiExtension(
     instances.push(toCommandDispatcher(name, commands, ctx));
   }
 
-  for (const instance of instances) {
+  // setActiveTools is enforced at registration time: an extension that
+  // narrows its active set has the rest dropped from the registry for
+  // this round-trip. Re-enabling on a later turn is a fresh load.
+  const activeNames = state.activeTools;
+  const finalInstances =
+    activeNames === null
+      ? instances
+      : instances.filter((tool) => activeNames.includes(tool.definition.name));
+
+  for (const instance of finalInstances) {
     registry.register(instance);
   }
 
-  return { name, path: extensionPath, tools: instances, unsupportedEvents };
+  return {
+    name,
+    path: extensionPath,
+    tools: finalInstances,
+    unsupportedEvents,
+  };
+}
+
+// Run every tool_call listener for a converted tool before its handler.
+// Returns the first blocking decision, or null to proceed. Non-blocking
+// listeners may return `before` hooks which run ahead of the handler.
+async function runToolCallListeners(
+  listeners: PiToolCallListener[],
+  toolName: string,
+  args: JsonObject,
+  execution: { context: unknown; toolCallId?: string },
+): Promise<PiToolCallDecision | null> {
+  for (const listener of listeners) {
+    const decision = await listener(
+      { toolName, args },
+      { context: execution.context, toolCallId: execution.toolCallId },
+    );
+    if (!decision) {
+      continue;
+    }
+    if (decision.before) {
+      await decision.before();
+    }
+    if (decision.block) {
+      return decision;
+    }
+  }
+  return null;
 }
 
 function toToolInstance(
@@ -386,9 +450,18 @@ function toToolInstance(
       parameters: toStrictParameters(tool.parameters),
     },
     handler: {
-      async execute(args) {
-        for (const listener of listeners) {
-          listener({ toolName: tool.name, args });
+      async execute(args, execution) {
+        const veto = await runToolCallListeners(
+          listeners,
+          tool.name,
+          args,
+          execution,
+        );
+        if (veto) {
+          return {
+            ok: false,
+            error: `blocked by policy: ${veto.reason ?? "no reason given"}`,
+          } satisfies ToolResult;
         }
         const result = await tool.execute(args, ctx);
         return result as JsonValue;
@@ -405,17 +478,26 @@ function wrapToolInstanceListeners(
   tool: ToolInstance,
   listeners: PiToolCallListener[],
 ): ToolInstance {
-  const inner = tool.handler;
   if (listeners.length === 0) {
     return { ...tool, source: "library" };
   }
+  const inner = tool.handler;
   return {
     ...tool,
     source: "library",
     handler: {
       async execute(args, execution) {
-        for (const listener of listeners) {
-          listener({ toolName: tool.definition.name, args });
+        const veto = await runToolCallListeners(
+          listeners,
+          tool.definition.name,
+          args,
+          execution,
+        );
+        if (veto) {
+          return {
+            ok: false,
+            error: `blocked by policy: ${veto.reason ?? "no reason given"}`,
+          } satisfies ToolResult;
         }
         return inner.execute(args, execution);
       },

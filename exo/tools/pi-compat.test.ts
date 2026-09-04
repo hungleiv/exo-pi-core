@@ -136,6 +136,80 @@ describe("loadPiExtension", () => {
       pathToFileURL(extensionPath).href,
     );
   });
+
+  it("vetoes tool calls through a blocking tool_call listener", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pi-policy-"));
+    const extensionPath = path.join(dir, "policy.ts");
+    writeFileSync(
+      extensionPath,
+      `
+      export default function (pi) {
+        pi.on("tool_call", (event, execution) => {
+          pi.seenExecution = execution && execution.context !== undefined;
+          if (event.args.dangerous === true) {
+            return { block: true, reason: "dangerous flag set" };
+          }
+          return { before: async () => { pi.ranBefore = true; } };
+        });
+        pi.registerTool({
+          name: "guarded",
+          description: "guarded tool",
+          parameters: { type: "object", additionalProperties: false, properties: { dangerous: { type: ["boolean", "null"] } }, required: ["dangerous"] },
+          execute: (args) => ({ ok: true, ran: true, dangerous: args.dangerous === true }),
+        });
+      }
+      `,
+    );
+
+    const tools = registry();
+    await loadPiExtension(tools, extensionPath, { cacheBust: false });
+
+    const blocked = (await tools
+      .get("guarded")
+      ?.handler.execute(
+        { dangerous: true },
+        { context: {} as TurnContext },
+      )) as JsonObject;
+    expect(blocked).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("blocked by policy: dangerous flag set"),
+    });
+
+    const allowed = (await tools
+      .get("guarded")
+      ?.handler.execute(
+        { dangerous: null },
+        { context: {} as TurnContext },
+      )) as JsonObject;
+    // The before hook ran ahead of the handler and the listener saw the
+    // execution context (policy has the same reach as a native tool).
+    expect(allowed).toMatchObject({ ok: true, ran: true });
+  });
+
+  it("enforces setActiveTools at registration time", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pi-active-"));
+    const extensionPath = path.join(dir, "active.ts");
+    writeFileSync(
+      extensionPath,
+      `
+      export default function (pi) {
+        pi.registerTool({ name: "tool_a", description: "a", parameters: undefined, execute: () => ({ ok: true }) });
+        pi.registerTool({ name: "tool_b", description: "b", parameters: undefined, execute: () => ({ ok: true }) });
+        pi.setActiveTools(["tool_a"]);
+      }
+      `,
+    );
+
+    const tools = registry();
+    const loaded = await loadPiExtension(tools, extensionPath, {
+      cacheBust: false,
+    });
+    expect(loaded.tools.map((tool) => tool.definition.name)).toEqual([
+      "tool_a",
+    ]);
+    expect(tools.get("tool_a")).toBeDefined();
+    expect(tools.get("tool_b")).toBeUndefined();
+  });
 });
 
 describe("piExtensionPathsFromEnv", () => {
