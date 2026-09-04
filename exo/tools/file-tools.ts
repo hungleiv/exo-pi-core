@@ -142,7 +142,7 @@ function editToolInstance(): ToolInstance {
               `edits[${index}].old_text matches ${occurrences} times in ${path} (must match exactly once); file left unchanged`,
             );
           }
-          content = content.replace(edit.oldText, edit.newText);
+          content = content.replace(edit.oldText, () => edit.newText);
         }
         await writeFile(execution, path, content);
         return { path, edits_applied: edits.length };
