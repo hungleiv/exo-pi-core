@@ -7,7 +7,7 @@ import {
   buildModelStub,
   createExoStreamFn,
   exoMessagesToAgentSeed,
-  looksLikeMalformedToolCallAttempt,
+  looksLikeUnfinishedTurn,
   piEventToExoEvents,
   toolInstanceToAgentTool,
 } from "./pi-agent-adapters";
@@ -260,35 +260,122 @@ describe("piEventToExoEvents", () => {
     });
     expect(events).toEqual([]);
   });
+
+  it("records a stopReason error as a visible diagnostic message instead of dropping it", () => {
+    const events = piEventToExoEvents({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        api: "openai-responses",
+        provider: "exo",
+        model: "gpt-5.5",
+        usage: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          totalTokens: 0,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: "error",
+        errorMessage: "provider unavailable",
+        timestamp: Date.now(),
+      },
+    });
+    expect(events).toEqual([
+      {
+        type: "messages",
+        messages: [
+          {
+            role: "assistant",
+            content: "[turn ended: model call failed] provider unavailable",
+          },
+        ],
+        response_id: undefined,
+      },
+    ]);
+  });
 });
 
 describe("createExoStreamFn", () => {
   const model = buildModelStub("gpt-5.5");
 
-  it("replays a successful runtime.complete() as a start+done pair", async () => {
-    const runtime: Pick<ResponsesRuntimeLike, "complete"> = {
-      async complete() {
-        return {
-          // output_text is deliberately omitted here: ChatCompletionsRuntime
-          // (OpenRouter and most non-OpenAI-Responses models) never
-          // populates it - only response.output does, in this shape.
-          output: [
-            {
-              type: "message",
-              role: "assistant",
-              status: "completed",
-              content: [
-                { type: "output_text", text: "hi there", annotations: [] },
-              ],
-            },
-          ],
-          usage: {
-            input_tokens: 3,
-            output_tokens: 2,
-          },
-          // minimal fake Response, only the fields the adapter reads are
-          // populated.
-        } as never;
+  function fakeResponse(text: string) {
+    return {
+      // output_text is deliberately omitted: ChatCompletionsRuntime
+      // (OpenRouter and most non-OpenAI-Responses models) never populates
+      // it - only response.output does, in this shape.
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text, annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 3, output_tokens: 2 },
+      // minimal fake Response, only the fields the adapter reads are
+      // populated.
+    } as never;
+  }
+
+  it("streams real deltas as text_start/text_delta/text_end, then start+done", async () => {
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream(_request, handlers) {
+        await handlers?.onFirstChunk?.(42);
+        await handlers?.onTextDelta?.("hi ");
+        await handlers?.onTextDelta?.("there");
+        return fakeResponse("hi there");
+      },
+    };
+    const seenDeltas: string[] = [];
+    let ttft: number | undefined;
+    const streamFn = createExoStreamFn(
+      runtime as ResponsesRuntimeLike,
+      "gpt-5.5",
+      {
+        onFirstChunk: (ms) => {
+          ttft = ms;
+        },
+        onTextDelta: (text) => {
+          seenDeltas.push(text);
+        },
+      },
+    );
+    const stream = await streamFn(model, { messages: [] });
+
+    const events = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+    expect(events.map((event) => event.type)).toEqual([
+      "start",
+      "text_start",
+      "text_delta",
+      "text_delta",
+      "text_end",
+      "done",
+    ]);
+    expect(ttft).toBe(42);
+    // options.onTextDelta (-> context.stream.text in the real harness) sees
+    // every raw delta, not just the final accumulated text.
+    expect(seenDeltas).toEqual(["hi ", "there"]);
+
+    const done = events[5] as { type: "done"; message: AssistantMessage };
+    expect(done.message.content).toEqual([{ type: "text", text: "hi there" }]);
+    expect(done.message.stopReason).toBe("stop");
+    expect(done.message.usage.input).toBe(3);
+    expect(done.message.usage.output).toBe(2);
+
+    const result = await stream.result();
+    expect(result.content).toEqual([{ type: "text", text: "hi there" }]);
+  });
+
+  it("skips text_start/text_end when the response has no text deltas at all", async () => {
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream() {
+        return fakeResponse("");
       },
     };
     const streamFn = createExoStreamFn(
@@ -302,19 +389,11 @@ describe("createExoStreamFn", () => {
       events.push(event);
     }
     expect(events.map((event) => event.type)).toEqual(["start", "done"]);
-    const done = events[1] as { type: "done"; message: AssistantMessage };
-    expect(done.message.content).toEqual([{ type: "text", text: "hi there" }]);
-    expect(done.message.stopReason).toBe("stop");
-    expect(done.message.usage.input).toBe(3);
-    expect(done.message.usage.output).toBe(2);
-
-    const result = await stream.result();
-    expect(result.content).toEqual([{ type: "text", text: "hi there" }]);
   });
 
   it("never throws: encodes a runtime failure as a start+error pair", async () => {
-    const runtime: Pick<ResponsesRuntimeLike, "complete"> = {
-      async complete() {
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream() {
         throw new Error("provider unavailable");
       },
     };
@@ -335,10 +414,10 @@ describe("createExoStreamFn", () => {
   });
 });
 
-describe("looksLikeMalformedToolCallAttempt", () => {
+describe("looksLikeUnfinishedTurn", () => {
   it("flags an assistant message with no real tool call but tool-call-shaped text", () => {
     expect(
-      looksLikeMalformedToolCallAttempt({
+      looksLikeUnfinishedTurn({
         role: "assistant",
         content: [{ type: "text", text: '[TOOL_CALL shell] {"command":"ls"}' }],
       }),
@@ -347,16 +426,46 @@ describe("looksLikeMalformedToolCallAttempt", () => {
 
   it("flags a leaked chat-template tool-call token", () => {
     expect(
-      looksLikeMalformedToolCallAttempt({
+      looksLikeUnfinishedTurn({
         role: "assistant",
         content: [{ type: "text", text: "done</minimax:tool_call>" }],
       }),
     ).toBe(true);
   });
 
+  it("flags a genuinely empty response (the exo-bench t5-pipeline failure shape)", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: [],
+        stopReason: "stop",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not flag an empty message with stopReason error - followUp() can't help there", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+      }),
+    ).toBe(false);
+  });
+
+  it("does not flag an empty message with stopReason aborted", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: [],
+        stopReason: "aborted",
+      }),
+    ).toBe(false);
+  });
+
   it("does not flag a message that has a real toolCall content part", () => {
     expect(
-      looksLikeMalformedToolCallAttempt({
+      looksLikeUnfinishedTurn({
         role: "assistant",
         content: [
           { type: "text", text: "I'll call the tool now." },
@@ -368,7 +477,7 @@ describe("looksLikeMalformedToolCallAttempt", () => {
 
   it("does not flag a genuine plain-text final answer", () => {
     expect(
-      looksLikeMalformedToolCallAttempt({
+      looksLikeUnfinishedTurn({
         role: "assistant",
         content: [{ type: "text", text: "The answer is 42." }],
       }),
@@ -377,7 +486,7 @@ describe("looksLikeMalformedToolCallAttempt", () => {
 
   it("does not flag non-assistant messages", () => {
     expect(
-      looksLikeMalformedToolCallAttempt({
+      looksLikeUnfinishedTurn({
         role: "user",
         content: "tool_call whatever",
       }),
@@ -385,8 +494,6 @@ describe("looksLikeMalformedToolCallAttempt", () => {
   });
 
   it("does not flag a message with no content array (e.g. a custom AgentMessage variant)", () => {
-    expect(looksLikeMalformedToolCallAttempt({ role: "assistant" })).toBe(
-      false,
-    );
+    expect(looksLikeUnfinishedTurn({ role: "assistant" })).toBe(false);
   });
 });

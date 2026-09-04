@@ -17,10 +17,6 @@
 //     AssistantMessage with stopReason "error"/"aborted".
 //
 // Known prototype limitations (not yet production-grade):
-//   - createExoStreamFn issues one non-streaming runtime.complete() call per
-//     round and replays it as a single start/done pair - no incremental
-//     token deltas reach pi's Agent (Exo's own context.stream.text still
-//     gets real text once per round, not token-by-token).
 //   - Historical messages seeded into a fresh Agent (exoMessagesToAgentSeed,
 //     used once at turn start) are re-encoded as plain text rather than a
 //     provider-native transcript replay - fine for coherent context on the
@@ -226,23 +222,78 @@ export function buildModelStub(modelId: string): PiModel<PiApi> {
 }
 
 // ---------------------------------------------------------------------------
-// StreamFn adapter: wraps Exo's existing ResponsesRuntimeLike.complete() so
-// pi's Agent drives the tool loop while Exo's model/secret/cost plumbing
+// StreamFn adapter: wraps Exo's existing ResponsesRuntimeLike.completeStream()
+// so pi's Agent drives the tool loop while Exo's model/secret/cost plumbing
 // (runtimeFromModelBinding, Braintrust tracing, price table) stays untouched.
+// Real token deltas: onTextDelta below forwards every chunk both into the
+// pi-ai event protocol (text_start/text_delta/text_end, so anything
+// consuming the Agent's own event stream sees incremental text) and, via
+// options.onTextDelta, out to Exo's own context.stream.text() - the same
+// call the original runResponsesTurnLoop makes - so a live REPL/websocket
+// client sees tokens arrive as they're generated instead of one block at
+// the end of the round.
 // ---------------------------------------------------------------------------
+
+export interface CreateExoStreamFnOptions {
+  onFirstChunk?: (ttftMs: number) => void | Promise<void>;
+  onTextDelta?: (text: string) => void | Promise<void>;
+}
 
 export function createExoStreamFn(
   runtime: ResponsesRuntimeLike,
   exoModelId: string,
+  options: CreateExoStreamFnOptions = {},
 ): StreamFn {
   return (model, context) => {
     const stream = createAssistantMessageEventStream();
     void (async () => {
+      let text = "";
+      let textStarted = false;
+      let started = false;
+      const partial = (): AssistantMessage => ({
+        role: "assistant",
+        content: text ? [{ type: "text", text }] : [],
+        api: model.api,
+        provider: model.provider,
+        model: model.id,
+        usage: EMPTY_USAGE,
+        stopReason: "pending",
+        timestamp: Date.now(),
+      });
       try {
         const request = piContextToNativeRequest(exoModelId, context);
-        const response = await runtime.complete(request);
+        started = true;
+        stream.push({ type: "start", partial: partial() });
+        const response = await runtime.completeStream(request, {
+          onFirstChunk: options.onFirstChunk,
+          onTextDelta: async (delta) => {
+            if (!textStarted) {
+              textStarted = true;
+              stream.push({
+                type: "text_start",
+                contentIndex: 0,
+                partial: partial(),
+              });
+            }
+            text += delta;
+            stream.push({
+              type: "text_delta",
+              contentIndex: 0,
+              delta,
+              partial: partial(),
+            });
+            await options.onTextDelta?.(delta);
+          },
+        });
+        if (textStarted) {
+          stream.push({
+            type: "text_end",
+            contentIndex: 0,
+            content: text,
+            partial: partial(),
+          });
+        }
         const assistantMessage = responseToAssistantMessage(response, model);
-        stream.push({ type: "start", partial: assistantMessage });
         stream.push({
           type: "done",
           reason: assistantMessage.stopReason as Extract<
@@ -254,9 +305,14 @@ export function createExoStreamFn(
         stream.end(assistantMessage);
       } catch (error) {
         // Contract: streamFn must not throw or return a rejected promise -
-        // failures are encoded in the stream itself.
+        // failures are encoded in the stream itself. "start" was already
+        // pushed above unless piContextToNativeRequest itself threw before
+        // reaching it - only push it here in that one case, so a failure
+        // mid-stream doesn't produce two "start" events.
         const errorMessage = buildErrorAssistantMessage(model, error);
-        stream.push({ type: "start", partial: errorMessage });
+        if (!started) {
+          stream.push({ type: "start", partial: errorMessage });
+        }
         stream.push({ type: "error", reason: "error", error: errorMessage });
         stream.end(errorMessage);
       }
@@ -420,20 +476,38 @@ function buildErrorAssistantMessage(
 }
 
 // ---------------------------------------------------------------------------
-// Malformed-tool-call detection: benchmarking against a live free/weak model
-// (see harness-pi-core.ts) found it repeatedly emits its tool call as plain
-// text (e.g. "[TOOL_CALL shell] {...}" or a leaked "</minimax:tool_call>"
-// chat-template token) instead of a real structured tool call. When that
-// happens content has no "toolCall" part, so pi-agent-core's Agent sees a
-// turn with zero tool results and stops - unlike Exo's own turn loop, which
-// hits an explicit parse error from the model API and keeps looping until it
-// gets a real one. Same underlying model flakiness, different failure mode:
-// exo-bench fails loud and retries by construction; the pi-core-bench loop
-// exits quietly. This heuristic lets the harness recognize "that wasn't
-// actually a finished answer" and nudge a retry via agent.followUp() instead
-// of ending the turn early. False positives (a genuine final answer that
-// happens to mention "tool call") are the deliberate failure mode here - one
-// extra clarifying round costs far less than silently abandoning the task.
+// Unfinished-turn detection: benchmarking against a live free/weak model
+// (see harness-pi-core.ts) found two ways a turn ends with zero tool results
+// while the task plainly isn't done:
+//   - the model emits its tool call as plain text (e.g. "[TOOL_CALL shell]
+//     {...}" or a leaked "</minimax:tool_call>" chat-template token) instead
+//     of a real structured tool call - content has no "toolCall" part, so
+//     the turn looks like ordinary text output.
+//   - the model returns a genuinely empty message: no text, no tool call,
+//     stopReason "stop" - this is exactly the shape hit live on exo-bench's
+//     own (unmodified) turn loop on the t5-pipeline case: it wrote three
+//     scripts, then a later round came back empty and the turn just ended
+//     with no final message. Exo's loop has no way to tell "empty" apart
+//     from "a legitimately short final answer" either - this harness has
+//     the same blind spot, just via a different code path.
+// In both cases pi-agent-core's Agent sees zero tool results and stops -
+// unlike Exo's own turn loop, which at least hits an explicit parse error
+// from the model API on a malformed tool call and keeps looping until it
+// gets a real one (though not on a truly empty response, which is exactly
+// the exo-bench failure above). Same underlying model flakiness, different
+// failure shape depending on the path. This heuristic lets the harness
+// recognize "that wasn't actually a finished answer" and nudge a retry via
+// agent.followUp() instead of ending the turn early. False positives (a
+// genuine final answer that happens to mention "tool call", or is
+// legitimately terse) are the deliberate failure mode here - one extra
+// clarifying round costs far less than silently abandoning the task.
+//
+// Deliberately excludes stopReason "error"/"aborted": pi-agent-core's Agent
+// returns immediately for those (agent-loop.js's runLoop never reaches the
+// getFollowUpMessages() check on that path), so a followUp() call here
+// would be queued and then never read. See the "error" branch of
+// piEventToExoEvents for how that case is handled instead - recorded, not
+// retried.
 // ---------------------------------------------------------------------------
 
 const MALFORMED_TOOL_CALL_TEXT_PATTERN = /tool[_ ]call/i;
@@ -444,11 +518,17 @@ const MALFORMED_TOOL_CALL_TEXT_PATTERN = /tool[_ ]call/i;
 // CustomAgentMessages - not every member has a "content" array of the shape
 // AssistantMessage promises, so this checks defensively instead of trusting
 // the type.
-export function looksLikeMalformedToolCallAttempt(message: {
+export function looksLikeUnfinishedTurn(message: {
   role: string;
   content?: unknown;
+  stopReason?: unknown;
 }): boolean {
-  if (message.role !== "assistant" || !Array.isArray(message.content)) {
+  if (
+    message.role !== "assistant" ||
+    !Array.isArray(message.content) ||
+    message.stopReason === "error" ||
+    message.stopReason === "aborted"
+  ) {
     return false;
   }
   const parts = message.content as Array<Record<string, unknown>>;
@@ -463,7 +543,9 @@ export function looksLikeMalformedToolCallAttempt(message: {
     )
     .map((part) => part.text)
     .join("");
-  return MALFORMED_TOOL_CALL_TEXT_PATTERN.test(text);
+  return (
+    text.trim().length === 0 || MALFORMED_TOOL_CALL_TEXT_PATTERN.test(text)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +604,22 @@ export function piEventToExoEvents(event: PiRecordableEvent): EventData[] {
   }
   if (event.message.role !== "assistant") {
     return [];
+  }
+  // A round that failed at the streamFn level (see createExoStreamFn's
+  // catch block) surfaces here as stopReason "error" with empty content.
+  // pi-agent-core's Agent returns immediately in this case - it never
+  // reaches the follow-up check, so looksLikeUnfinishedTurn's retry nudge
+  // can't help (see its comment). Record the failure instead of silently
+  // dropping it: an operator reading the event log should see why a turn
+  // ended with no answer, not nothing at all.
+  if (event.message.stopReason === "error") {
+    return [
+      messagesEvent([
+        assistantTextMessage(
+          `[turn ended: model call failed] ${event.message.errorMessage ?? "unknown error"}`,
+        ),
+      ]),
+    ];
   }
   const text = piAssistantText(event.message);
   if (!text) {

@@ -39,19 +39,20 @@ import {
   buildModelStub,
   createExoStreamFn,
   exoMessagesToAgentSeed,
-  looksLikeMalformedToolCallAttempt,
+  looksLikeUnfinishedTurn,
   piEventToExoEvents,
   toolInstanceToAgentTool,
   type PiRecordableEvent,
 } from "./tools/pi-agent-adapters";
 
-// Cap on how many times a single turn will nudge the model to retry a
-// malformed tool call before giving up and letting the turn end anyway - see
-// looksLikeMalformedToolCallAttempt's comment for why this exists. Chosen to
+// Cap on how many times a single turn will nudge the model to retry an
+// unfinished turn (malformed tool call, or a genuinely empty response)
+// before giving up and letting the turn end anyway - see
+// looksLikeUnfinishedTurn's comment for why this exists. Chosen to
 // comfortably cover what live benchmarking needed (usually 1, at most a
 // couple) without risking a runaway loop against a model that never manages
 // a real tool call.
-const MAX_MALFORMED_TOOL_CALL_NUDGES = 5;
+const MAX_UNFINISHED_TURN_NUDGES = 5;
 
 export default defineHarness({
   async runTurn(context) {
@@ -91,10 +92,13 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
       tools: agentTools,
       messages: seed.messages,
     },
-    streamFn: createExoStreamFn(runtime, modelBinding.model),
+    streamFn: createExoStreamFn(runtime, modelBinding.model, {
+      onFirstChunk: (ttftMs) => context.stream.firstChunk(ttftMs),
+      onTextDelta: (text) => context.stream.text(text),
+    }),
   });
 
-  let malformedToolCallNudges = 0;
+  let unfinishedTurnNudges = 0;
   agent.subscribe(async (event) => {
     if (isRecordableEvent(event)) {
       const events = piEventToExoEvents(event);
@@ -102,25 +106,25 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
         await appendEvents(context, events);
       }
     }
-    // A turn that ended with no tool results but text that looks like a
-    // botched tool-call attempt isn't actually finished - nudge a retry
-    // instead of letting the Agent treat it as a normal stop. followUp()
-    // only takes effect once the agent would otherwise stop (pi-agent-core's
-    // own mechanism for this - pi-coding-agent's CLI relies on the same
-    // "hasMoreToolCalls || pendingMessages" loop condition, it just tends to
-    // get well-formed tool calls from the model more often in the first
-    // place).
+    // A turn that ended with no tool results and either a botched tool-call
+    // attempt or a genuinely empty response isn't actually finished - nudge
+    // a retry instead of letting the Agent treat it as a normal stop.
+    // followUp() only takes effect once the agent would otherwise stop
+    // (pi-agent-core's own mechanism for this - pi-coding-agent's CLI relies
+    // on the same "hasMoreToolCalls || pendingMessages" loop condition, it
+    // just tends to get well-formed, non-empty responses from the model
+    // more often in the first place).
     if (
       event.type === "turn_end" &&
       event.toolResults.length === 0 &&
-      malformedToolCallNudges < MAX_MALFORMED_TOOL_CALL_NUDGES &&
-      looksLikeMalformedToolCallAttempt(event.message)
+      unfinishedTurnNudges < MAX_UNFINISHED_TURN_NUDGES &&
+      looksLikeUnfinishedTurn(event.message)
     ) {
-      malformedToolCallNudges += 1;
+      unfinishedTurnNudges += 1;
       agent.followUp({
         role: "user",
         content:
-          "Your previous reply did not contain a real tool call - it looks like you described one as plain text instead of actually invoking the tool. Call the tool again using the actual function-calling mechanism, not text describing it.",
+          "Your previous reply didn't finish the task - it was either empty or described a tool call as plain text instead of actually invoking it. Continue the task: call the tool using the actual function-calling mechanism, or give a real final answer if the work is genuinely done.",
         timestamp: Date.now(),
       });
     }
