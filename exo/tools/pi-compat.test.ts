@@ -1,4 +1,4 @@
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { mkdtempSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -128,8 +128,13 @@ describe("loadPiExtension", () => {
     utimesSync(extensionPath, later, later);
     const after = piExtensionModuleUrl(extensionPath);
 
+    // Each saved version maps to a distinct dot-prefixed sibling path so
+    // the module cache busts even when the loader strips URL queries.
     expect(before).not.toBe(after);
-    expect(piExtensionModuleUrl(extensionPath, false)).not.toContain("?v=");
+    expect(path.basename(before)).toMatch(/^\.ext--\d+-\d+\.ts$/);
+    expect(piExtensionModuleUrl(extensionPath, false)).toBe(
+      pathToFileURL(extensionPath).href,
+    );
   });
 });
 

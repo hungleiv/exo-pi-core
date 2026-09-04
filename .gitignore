@@ -11,3 +11,5 @@ website/dist
 website/.wrangler
 .exo
 .brain
+.exo/pi-cache
+exo/tools/extensions/.*--*.ts

@@ -26,7 +26,14 @@
 // execute function. It does not sandbox the JS itself; JS sandboxing in
 // Exo goes through the shell/sandbox tool boundary.
 
-import { statSync } from "node:fs";
+import {
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -145,20 +152,87 @@ function joinExtensionPath(prefix: string, entry: string): string {
 const SUPPORTED_EVENTS = new Set(["tool_call"]);
 
 // Build the module URL for an extension file. With cache busting, the file
-// mtime rides in a query string so the ESM loader treats each saved version
-// as a new module (verified under tsx; vitest's transform pipeline cannot
-// handle query imports, so tests disable it).
+// is copied next to the original under a dot-prefixed per-mtime name so
+// the ESM loader treats each saved version as a new module and edited code
+// reloads on the next turn. This is needed because the tsx loader strips
+// URL query strings, so a `?v=<mtime>` suffix does NOT bust the module
+// cache under tsx (verified: node honors the query, tsx does not). The
+// copy stays in the extension's own directory so relative imports inside
+// the extension keep resolving. Cache busting is disabled in test runners
+// whose transform pipeline cannot handle generated files.
 export function piExtensionModuleUrl(
   extensionPath: string,
   cacheBust = true,
 ): string {
-  const base = pathToFileURL(extensionPath).href;
   if (!cacheBust) {
-    return base;
+    return pathToFileURL(extensionPath).href;
   }
   const mtimeMs =
     statSync(extensionPath, { throwIfNoEntry: false })?.mtimeMs ?? 0;
-  return `${base}?v=${mtimeMs}`;
+  return pathToFileURL(piExtensionCachePath(extensionPath, mtimeMs)).href;
+}
+
+// Map an extension file + mtime onto a stable cache path: a dot-prefixed
+// sibling of the original (same directory, so relative imports resolve)
+// whose name encodes the source mtime.
+export function piExtensionCachePath(
+  extensionPath: string,
+  mtimeMs: number,
+): string {
+  const dir = path.dirname(extensionPath);
+  const ext = path.extname(extensionPath) || ".ts";
+  const base = path.basename(extensionPath, ext);
+  const stamp = `${mtimeMs}`.replace(/\./g, "-");
+  return path.join(dir, `.${base}--${stamp}${ext}`);
+}
+
+// Ensure the cache copy exists, written atomically, and return its path.
+function materializePiExtensionCache(
+  extensionPath: string,
+  mtimeMs: number,
+): string {
+  const cachePath = piExtensionCachePath(extensionPath, mtimeMs);
+  if (statSync(cachePath, { throwIfNoEntry: false }) === undefined) {
+    const source = readFileSync(extensionPath);
+    const temp = `${cachePath}.${randomUUID().slice(0, 8)}.tmp`;
+    writeFileSync(temp, source);
+    renameSync(temp, cachePath);
+  }
+  return cachePath;
+}
+
+// Drop stale cache copies for an extension (any dot-prefixed sibling whose
+// encoded mtime differs from the current one). Best-effort: ignore errors.
+export function prunePiExtensionCache(extensionPath: string): void {
+  const dir = path.dirname(extensionPath);
+  const ext = path.extname(extensionPath) || ".ts";
+  const base = path.basename(extensionPath, ext);
+  const prefix = `.${base}--`;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const current = piExtensionCachePath(
+    extensionPath,
+    statSync(extensionPath, { throwIfNoEntry: false })?.mtimeMs ?? 0,
+  );
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(ext)) {
+      continue;
+    }
+    const full = path.join(dir, entry);
+    if (full === current) {
+      continue;
+    }
+    try {
+      rmSync(full, { force: true });
+    } catch {
+      // Stale copy left behind; harmless because each mtime gets a fresh
+      // name and old modules already loaded stay in memory until restart.
+    }
+  }
 }
 
 function extensionNameFromPath(extensionPath: string): string {
@@ -255,14 +329,21 @@ export async function loadPiExtension(
     },
   };
 
-  // Cache-bust by mtime so editing an extension file takes effect on the
-  // next turn without restarting the harness (pi's /reload semantics; the
-  // registry is rebuilt every tool round-trip). Auto-disabled under vitest,
-  // whose transform pipeline cannot handle query imports.
-  const moduleUrl = piExtensionModuleUrl(
-    extensionPath,
-    options.cacheBust ?? process.env.VITEST === undefined,
-  );
+  // Cache-bust via a per-mtime cache copy so editing an extension file takes
+  // effect on the next turn without restarting the harness (pi's /reload
+  // semantics; the registry is rebuilt every tool round-trip). The tsx
+  // loader strips URL queries, so a fresh file path is the only reliable
+  // way to get a fresh module. Auto-disabled under vitest, whose transform
+  // pipeline cannot handle imports outside the project.
+  const cacheBust = options.cacheBust ?? process.env.VITEST === undefined;
+  const moduleUrl = cacheBust
+    ? pathToFileURL(
+        materializePiExtensionCache(
+          extensionPath,
+          statSync(extensionPath, { throwIfNoEntry: false })?.mtimeMs ?? 0,
+        ),
+      ).href
+    : piExtensionModuleUrl(extensionPath, false);
   const module = (await import(moduleUrl)) as unknown as { default?: unknown };
   if (typeof module.default !== "function") {
     throw new Error(`pi extension has no default export: ${extensionPath}`);
