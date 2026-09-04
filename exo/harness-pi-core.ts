@@ -86,6 +86,32 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
     .instances()
     .map((tool) => toolInstanceToAgentTool(tool, context));
 
+  // Config-audit findings (both silent gaps against the default harness,
+  // neither surfaced by benchmarking so far):
+  //
+  //   - maxToolRoundTrips: the original turn loop enforces
+  //     context.agentConfig.maxToolRoundTrips as a hard cap
+  //     (exoharness/typescript/model-runtime/turn-loop.ts). Agent has no
+  //     such option directly - shouldStopAfterTurn is the documented way to
+  //     add one. Without it, an operator-configured round limit (a real
+  //     cost/safety control, set via --max-tool-round-trips) was silently
+  //     unenforced here. completedRounds counts turns *after* they've
+  //     already run (shouldStopAfterTurn fires post-turn_end), so the exact
+  //     round arithmetic doesn't match turn-loop.ts's pre-round check
+  //     bit-for-bit - the point is having a real cap, not replicating an
+  //     off-by-one.
+  //
+  //   - toolExecution: Agent defaults to "parallel" (agent.js). The
+  //     original loop executes tool calls strictly sequentially
+  //     (`for (const toolCall of toolCalls) { await ... }`), which matters
+  //     here because Exo's tools (shell chief among them) share one sandbox
+  //     filesystem - two tool calls from the same assistant message running
+  //     concurrently could race on the same files. Left at the pi-agent-core
+  //     default, this harness would silently risk that race the first time
+  //     a model asked for more than one tool call in a single message.
+  const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
+  let completedRounds = 0;
+
   const agent = new Agent({
     initialState: {
       systemPrompt: seed.systemPrompt,
@@ -98,6 +124,15 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
       onTextDelta: (text) => context.stream.text(text),
     }),
     beforeToolCall: createProtectedPathBeforeToolCallHook(),
+    toolExecution: "sequential",
+    shouldStopAfterTurn: () => {
+      completedRounds += 1;
+      return (
+        maxToolRoundTrips !== null &&
+        maxToolRoundTrips !== undefined &&
+        completedRounds > maxToolRoundTrips
+      );
+    },
   });
 
   let unfinishedTurnNudges = 0;
