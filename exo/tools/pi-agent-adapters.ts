@@ -26,8 +26,35 @@
 //     content-part convention, matching what materializePromptMessages
 //     produces from a live event log - this was the fix for a real bug
 //     (see below), not a remaining gap.
+//   - No real multimodal support: piContentText always flattens images to
+//     the literal string "[image]" (matching Exo's own contentText()
+//     convention so the loss is at least visible, not silent - see its own
+//     comment). An image a user attaches never actually reaches the model
+//     through this harness. The default harness's fidelity here is
+//     unverified too; flagged as a gap either way, not claimed as a
+//     regression.
 //   - Usage accounting through this path is best-effort (falls back to 0);
 //     Exo's authoritative cost accounting happens elsewhere and is untouched.
+//
+// AgentOptions fields deliberately left unset, decided by config audit
+// (2026-09-04) rather than left unconsidered:
+//   - afterToolCall: not needed as a separate hook - compactToolResultForModel
+//     (large-result truncation, see toolInstanceToAgentTool) already runs at
+//     the one place that needs it, inside the tool's own execute(), which is
+//     simpler than routing the same data through a second Agent-level hook.
+//   - transformContext: this is pi-agent-core's documented seam for custom
+//     context pruning, and the closest thing to compaction available at this
+//     integration depth (see harness-pi-core.ts's header for why real
+//     compact()/AgentHarness isn't). Left unimplemented because no run in
+//     this session has actually hit a context-overflow failure to design
+//     against - compactToolResultForModel now also caps the largest known
+//     source of unbounded growth. Revisit if a real overflow shows up.
+//   - getApiKey, onPayload, onResponse, sessionId, thinkingBudgets,
+//     transport, maxRetryDelayMs: these decorate pi-ai's own provider/retry
+//     dispatch (models.streamSimple and friends). createExoStreamFn bypasses
+//     that dispatch entirely and calls Exo's own runtime.completeStream()
+//     directly, so none of these hooks would ever fire - not gaps, just not
+//     applicable to this streamFn's architecture.
 //
 // Bug fixed after live benchmarking (2026-09-04): piMessageToExoMessage
 // originally flattened every pi message to plain text, including assistant
@@ -115,12 +142,65 @@ export function toolInstanceToAgentTool(
       if (isToolFailure(result)) {
         throw new Error(toolFailureMessage(result));
       }
+      const compacted = await compactToolResultForModel(
+        context,
+        tool.definition.name,
+        toolCallId,
+        result,
+      );
       return {
-        content: [{ type: "text", text: stringifyToolResult(result) }],
-        details: result,
+        content: [{ type: "text", text: compacted.text }],
+        details: compacted.details,
       };
     },
   };
+}
+
+// Mirrors exoharness/typescript/harness/tools.ts's compactToolResult: large
+// tool output goes to an artifact, not straight into the model's context,
+// with a short preview standing in. This adapter had no such limit until
+// found by inspection (not benchmarking - the free models used so far never
+// happened to produce a giant tool result) - a tool like shell running `cat`
+// on a large file would otherwise put the *entire* output into every
+// subsequent round's context for the rest of the turn, via
+// piMessageToExoMessage carrying AgentToolResult.details through unbounded.
+// Not a byte-for-byte port: the original also splits shell stdout/stderr
+// into their own artifacts and threads artifact references through the
+// ToolResult value itself; this is a simpler single-artifact mirror that
+// still bounds the size, which is the property that matters here.
+const TOOL_RESULT_INLINE_LIMIT_CHARS = 8_000;
+const TOOL_RESULT_PREVIEW_CHARS = 4_000;
+
+async function compactToolResultForModel(
+  context: TurnContext,
+  toolName: string,
+  toolCallId: string,
+  result: unknown,
+): Promise<{ text: string; details: unknown }> {
+  const serialized = stringifyToolResult(result);
+  if (serialized.length <= TOOL_RESULT_INLINE_LIMIT_CHARS) {
+    return { text: serialized, details: result };
+  }
+  const artifact = await context.exoharness.current.turn.writeArtifactText({
+    path: `tool-results/${sanitizePathSegment(toolName)}/${sanitizePathSegment(toolCallId)}/result.json`,
+    text: serialized,
+  });
+  const preview = serialized.slice(0, TOOL_RESULT_PREVIEW_CHARS);
+  const text = `${preview}\n...[truncated ${serialized.length - TOOL_RESULT_PREVIEW_CHARS} more characters; full result written to artifact ${artifact.artifactId} at ${artifact.path}]`;
+  return {
+    text,
+    details: {
+      truncated: true,
+      preview,
+      artifactId: artifact.artifactId,
+      path: artifact.path,
+      sizeBytes: artifact.sizeBytes,
+    },
+  };
+}
+
+function sanitizePathSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 96) || "unknown";
 }
 
 function isToolFailure(
@@ -154,6 +234,17 @@ function stringifyToolResult(result: unknown): string {
 // "rm .env", for one) - conservative on purpose, since a false positive
 // just costs the model one blocked attempt while a false negative costs a
 // real file.
+//
+// This is a speed bump against a model naively writing where it shouldn't,
+// not a security boundary: a plain substring+regex match over the raw
+// command text is trivially defeated by anything that keeps ".env" out of
+// the literal text the guardrail sees - shell variable indirection
+// (`f=.env; rm .$f`... though `f=.env` itself still matches, a cleverer
+// split doesn't), quoting/escaping tricks, base64/hex-decoded commands
+// piped to a shell, or writing through another tool entirely if one is ever
+// registered. It stops the failure mode actually observed (a model asked to
+// touch some other file drifting onto .env by mistake), not a deliberately
+// adversarial one - same scope pi-coding-agent's own version claims.
 // ---------------------------------------------------------------------------
 
 const DEFAULT_PROTECTED_PATHS = [
@@ -481,6 +572,14 @@ function piAssistantContentParts(message: AssistantMessage): JsonValue[] {
   return parts;
 }
 
+// Matches Exo's own contentText()/messageText() convention (harness/index.ts)
+// of standing "[image]" in for an image part when flattening to plain text -
+// not full multimodal fidelity (piMessageToExoMessage always flattens to
+// text, so a real image never reaches the model through this path either
+// way), but at least leaves a visible trace instead of silently vanishing.
+// Silent loss was the actual bug found by inspection: this filtered image
+// parts out with no placeholder at all, unlike every other text-flattening
+// path in this file and in Exo's own harness.
 function piContentText(
   content: string | (PiTextContent | PiImageContent)[],
 ): string {
@@ -488,8 +587,7 @@ function piContentText(
     return content;
   }
   return content
-    .filter((part): part is PiTextContent => part.type === "text")
-    .map((part) => part.text)
+    .map((part) => (part.type === "text" ? part.text : "[image]"))
     .join("");
 }
 

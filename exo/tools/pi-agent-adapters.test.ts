@@ -90,6 +90,75 @@ describe("toolInstanceToAgentTool", () => {
     expect(seenCallId).toBe("call-42");
     expect(seenContext).toBe(context);
   });
+
+  it("passes a small result through unchanged, with no artifact written", async () => {
+    let writeArtifactTextCalls = 0;
+    const context = {
+      exoharness: {
+        current: {
+          turn: {
+            writeArtifactText: async () => {
+              writeArtifactTextCalls += 1;
+              throw new Error("should not be called for a small result");
+            },
+          },
+        },
+      },
+    } as unknown as TurnContext;
+    const agentTool = toolInstanceToAgentTool(
+      tool(async () => ({ ok: true, value: "small" })),
+      context,
+    );
+    const result = await agentTool.execute("call-1", {});
+    expect(result.details).toEqual({ ok: true, value: "small" });
+    expect(writeArtifactTextCalls).toBe(0);
+  });
+
+  it("truncates a large result to an artifact instead of putting it all in context", async () => {
+    const bigValue = "x".repeat(20_000);
+    let writtenPath: string | undefined;
+    let writtenText: string | undefined;
+    const context = {
+      exoharness: {
+        current: {
+          turn: {
+            writeArtifactText: async (args: { path: string; text: string }) => {
+              writtenPath = args.path;
+              writtenText = args.text;
+              return {
+                artifactId: "artifact-1",
+                path: args.path,
+                version: 1,
+                createdAt: "now",
+                sizeBytes: args.text.length,
+              };
+            },
+          },
+        },
+      },
+    } as unknown as TurnContext;
+    const agentTool = toolInstanceToAgentTool(
+      tool(async () => ({ ok: true, value: bigValue })),
+      context,
+    );
+    const result = await agentTool.execute("call-1", {});
+
+    expect(writtenPath).toBe("tool-results/echo/call-1/result.json");
+    expect(writtenText).toContain(bigValue);
+
+    const text = result.content[0];
+    expect(text?.type).toBe("text");
+    expect(text && "text" in text ? text.text.length : 0).toBeLessThan(
+      writtenText?.length ?? Infinity,
+    );
+    expect(text && "text" in text ? text.text : "").toContain(
+      "full result written to artifact artifact-1",
+    );
+    expect(result.details).toMatchObject({
+      truncated: true,
+      artifactId: "artifact-1",
+    });
+  });
 });
 
 describe("exoMessagesToAgentSeed", () => {
@@ -361,6 +430,38 @@ describe("createExoStreamFn", () => {
       // populated.
     } as never;
   }
+
+  it("stands in [image] for an image part instead of silently dropping it", async () => {
+    let seenUserContent: unknown;
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream(request) {
+        seenUserContent = request.messages?.find(
+          (m) => m.role === "user",
+        )?.content;
+        return fakeResponse("ok");
+      },
+    };
+    const streamFn = createExoStreamFn(
+      runtime as ResponsesRuntimeLike,
+      "gpt-5.5",
+    );
+    const stream = await streamFn(model, {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "look: " },
+            { type: "image", data: "base64...", mimeType: "image/png" },
+          ],
+          timestamp: Date.now(),
+        },
+      ],
+    });
+    for await (const _event of stream) {
+      // drain
+    }
+    expect(seenUserContent).toBe("look: [image]");
+  });
 
   it("streams real deltas as text_start/text_delta/text_end, then start+done", async () => {
     const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
