@@ -38,6 +38,7 @@ import { exoInstructions, registerExoTools } from "./harness";
 import {
   buildModelStub,
   createExoStreamFn,
+  createProtectedPathBeforeToolCallHook,
   exoMessagesToAgentSeed,
   looksLikeUnfinishedTurn,
   piEventToExoEvents,
@@ -96,6 +97,7 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
       onFirstChunk: (ttftMs) => context.stream.firstChunk(ttftMs),
       onTextDelta: (text) => context.stream.text(text),
     }),
+    beforeToolCall: createProtectedPathBeforeToolCallHook(),
   });
 
   let unfinishedTurnNudges = 0;

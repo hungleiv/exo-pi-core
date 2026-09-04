@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildModelStub,
   createExoStreamFn,
+  createProtectedPathBeforeToolCallHook,
   exoMessagesToAgentSeed,
   looksLikeUnfinishedTurn,
   piEventToExoEvents,
@@ -411,6 +412,88 @@ describe("createExoStreamFn", () => {
     const errored = events[1] as { type: "error"; error: AssistantMessage };
     expect(errored.error.stopReason).toBe("error");
     expect(errored.error.errorMessage).toBe("provider unavailable");
+  });
+
+  it("bounds a stuck provider call instead of waiting forever", async () => {
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      completeStream() {
+        return new Promise(() => {
+          // never resolves - simulates a genuinely stuck connection.
+        });
+      },
+    };
+    const streamFn = createExoStreamFn(
+      runtime as ResponsesRuntimeLike,
+      "gpt-5.5",
+      {
+        timeoutMs: 20,
+      },
+    );
+    const stream = await streamFn(model, { messages: [] });
+
+    const events = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+    expect(events.map((event) => event.type)).toEqual(["start", "error"]);
+    const errored = events[1] as { type: "error"; error: AssistantMessage };
+    expect(errored.error.errorMessage).toBe("model call timed out after 20ms");
+  });
+});
+
+describe("createProtectedPathBeforeToolCallHook", () => {
+  const hook = createProtectedPathBeforeToolCallHook();
+
+  function toolCallContext(name: string, args: unknown) {
+    return { toolCall: { name }, args } as Parameters<typeof hook>[0];
+  }
+
+  it("blocks a redirect into a protected path", async () => {
+    const result = await hook(
+      toolCallContext("shell", { command: "echo secret > .env" }),
+    );
+    expect(result?.block).toBe(true);
+    expect(result?.reason).toContain(".env");
+  });
+
+  it("blocks rm targeting a protected path", async () => {
+    const result = await hook(
+      toolCallContext("shell", { command: "rm -rf .git/hooks" }),
+    );
+    expect(result?.block).toBe(true);
+  });
+
+  it("allows a plain read of a protected path", async () => {
+    const result = await hook(
+      toolCallContext("shell", { command: "cat .env" }),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("allows writes outside any protected path", async () => {
+    const result = await hook(
+      toolCallContext("shell", { command: "echo hi > notes.txt" }),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("ignores tool calls that aren't shell", async () => {
+    const result = await hook(
+      toolCallContext("web_fetch", { url: "https://example.com" }),
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it("honors a custom protected-path list", async () => {
+    const customHook = createProtectedPathBeforeToolCallHook(["secrets/"]);
+    const blocked = await customHook(
+      toolCallContext("shell", { command: "rm secrets/prod.key" }),
+    );
+    expect(blocked?.block).toBe(true);
+    const allowed = await customHook(
+      toolCallContext("shell", { command: "rm .env" }),
+    );
+    expect(allowed).toBeUndefined();
   });
 });
 
