@@ -30,6 +30,9 @@ const PROVIDER_KEY_VARIABLES: Record<string, string> = {
   openai: "OPENAI_API_KEY",
   anthropic: "ANTHROPIC_API_KEY",
   google: "GEMINI_API_KEY",
+  // pi's own model registry (@earendil-works/pi-ai) has native openrouter
+  // support and reads this exact variable (providers/openrouter.js).
+  openrouter: "OPENROUTER_API_KEY",
 };
 
 // exo names a model on its own; `provider/model` selects one explicitly.

@@ -1,0 +1,549 @@
+// Prototype adapters bridging Exo's own tool/model abstractions to the real
+// @earendil-works/pi-agent-core Agent engine. See ../harness-pi-core.ts for
+// the harness entry point that wires these together into a turn.
+//
+// This exists to validate (with real, installed packages, not guesses) the
+// two integration seams identified while comparing Exo's turn loop
+// (exoharness/typescript/model-runtime/turn-loop.ts) against Pi's real
+// architecture:
+//
+//   - AgentTool: pi's Tool.parameters wants a TypeBox `TSchema`, but a
+//     TypeBox schema is a plain JSON Schema object at runtime - Exo's
+//     already-strict JSON Schema just needs a type-level cast, not a
+//     rewrite. execute() throws on failure (pi's convention) instead of
+//     returning { ok: false } (Exo's convention); adapted here.
+//   - StreamFn (pi-agent-core/dist/stream-fn.d.ts): must never throw.
+//     Failures must be encoded as a start+error event pair ending in an
+//     AssistantMessage with stopReason "error"/"aborted".
+//
+// Known prototype limitations (not yet production-grade):
+//   - createExoStreamFn issues one non-streaming runtime.complete() call per
+//     round and replays it as a single start/done pair - no incremental
+//     token deltas reach pi's Agent (Exo's own context.stream.text still
+//     gets real text once per round, not token-by-token).
+//   - Historical messages seeded into a fresh Agent (exoMessagesToAgentSeed,
+//     used once at turn start) are re-encoded as plain text rather than a
+//     provider-native transcript replay - fine for coherent context on the
+//     first round. Mid-turn round-tripping (piMessageToExoMessage, used on
+//     every round after the first) preserves real tool_call/tool_result
+//     content blocks via Exo's own toolResultMessage() helper and message
+//     content-part convention, matching what materializePromptMessages
+//     produces from a live event log - this was the fix for a real bug
+//     (see below), not a remaining gap.
+//   - Usage accounting through this path is best-effort (falls back to 0);
+//     Exo's authoritative cost accounting happens elsewhere and is untouched.
+//
+// Bug fixed after live benchmarking (2026-09-04): piMessageToExoMessage
+// originally flattened every pi message to plain text, including assistant
+// tool calls. That produced a message sequence a "tool" role message can't
+// legally follow (no matching tool_call to point back at), which made the
+// *second* runtime.complete() call of a turn fail - silently, because
+// createExoStreamFn's never-throw contract turns that failure into an empty
+// error AssistantMessage, and piEventToExoEvents only records message_end
+// events that carry text. Net effect: any task needing more than one tool
+// round-trip stopped dead after the first tool call, with no error visible
+// anywhere in Exo's event log. Confirmed via exo conversation send against a
+// live sandbox + free OpenRouter model, comparing against the original
+// harness on identical prompts.
+
+import type {
+  AgentTool,
+  AgentToolResult,
+  StreamFn,
+} from "@earendil-works/pi-agent-core";
+import {
+  createAssistantMessageEventStream,
+  type Api as PiApi,
+  type AssistantMessage,
+  type Context as PiContext,
+  type ImageContent as PiImageContent,
+  type Message as PiMessage,
+  type Model as PiModel,
+  type TextContent as PiTextContent,
+} from "@earendil-works/pi-ai";
+import type { TSchema } from "typebox";
+
+import {
+  assistantTextMessage,
+  messageText,
+  messagesEvent,
+  toolRequestedEvent,
+  toolResultEvent,
+  toolResultMessage,
+  type EventData,
+  type JsonObject,
+  type JsonValue,
+  type Message,
+  type ToolInstance,
+  type TurnContext,
+} from "@exo/harness";
+import {
+  responseMessages,
+  responseToolCalls,
+  type NativeResponsesRequest,
+  type ResponsesRuntimeLike,
+} from "@exo/model-runtime/responses";
+import type { Response as OpenAIResponse } from "openai/resources/responses/responses";
+
+// Copied from pi-agent-core's own agent.js EMPTY_USAGE default so a
+// synthetic AssistantMessage satisfies the (non-optional) Usage shape.
+const EMPTY_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+// ---------------------------------------------------------------------------
+// Tool adapter: ToolInstance -> AgentTool
+// ---------------------------------------------------------------------------
+
+export function toolInstanceToAgentTool(
+  tool: ToolInstance,
+  context: TurnContext,
+): AgentTool {
+  return {
+    name: tool.definition.name,
+    label: tool.definition.name,
+    description: tool.definition.description,
+    parameters: tool.definition.parameters as unknown as TSchema,
+    async execute(toolCallId, params): Promise<AgentToolResult<unknown>> {
+      const result = await tool.handler.execute(params as JsonObject, {
+        context,
+        toolCallId,
+      });
+      if (isToolFailure(result)) {
+        throw new Error(toolFailureMessage(result));
+      }
+      return {
+        content: [{ type: "text", text: stringifyToolResult(result) }],
+        details: result,
+      };
+    },
+  };
+}
+
+function isToolFailure(
+  result: unknown,
+): result is { ok: false; error?: unknown } {
+  return (
+    Boolean(result) &&
+    typeof result === "object" &&
+    !Array.isArray(result) &&
+    (result as { ok?: unknown }).ok === false
+  );
+}
+
+function toolFailureMessage(result: { ok: false; error?: unknown }): string {
+  return typeof result.error === "string" ? result.error : "tool call failed";
+}
+
+function stringifyToolResult(result: unknown): string {
+  return typeof result === "string" ? result : JSON.stringify(result, null, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Seed conversion: Exo Message[] -> { systemPrompt, messages: PiMessage[] }
+// Used once, up front, to seed a fresh Agent's initialState before
+// Agent.continue() takes over driving the transcript itself.
+// ---------------------------------------------------------------------------
+
+export interface ExoConversationSeed {
+  systemPrompt: string;
+  messages: PiMessage[];
+}
+
+export function exoMessagesToAgentSeed(
+  messages: Message[],
+): ExoConversationSeed {
+  const systemParts: string[] = [];
+  const piMessages: PiMessage[] = [];
+  for (const message of messages) {
+    const text = messageText(message);
+    if (!text) {
+      continue;
+    }
+    if (message.role === "system" || message.role === "developer") {
+      systemParts.push(text);
+      continue;
+    }
+    if (message.role === "user") {
+      piMessages.push({ role: "user", content: text, timestamp: Date.now() });
+      continue;
+    }
+    if (message.role === "assistant") {
+      piMessages.push(placeholderAssistantMessage(text));
+      continue;
+    }
+    // role === "tool": a seeded historical tool result has no toolCallId
+    // pi's Agent recognizes from its own transcript, so it can't be a real
+    // ToolResultMessage. Folded into a synthetic user note instead - keeps
+    // the context, isn't a faithful replay.
+    piMessages.push({
+      role: "user",
+      content: `[prior tool result]\n${text}`,
+      timestamp: Date.now(),
+    });
+  }
+  return { systemPrompt: systemParts.join("\n\n"), messages: piMessages };
+}
+
+function placeholderAssistantMessage(text: string): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "openai-responses",
+    provider: "exo",
+    model: "unknown",
+    usage: EMPTY_USAGE,
+    stopReason: "stop",
+    timestamp: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Model stub: pi's Agent wants a Model<Api> to pass to streamFn and to stamp
+// onto AssistantMessage.api/provider/model. Exo's own model routing
+// (secret store, provider selection) stays entirely inside
+// runtimeFromModelBinding; this stub only carries the id through.
+// ---------------------------------------------------------------------------
+
+export function buildModelStub(modelId: string): PiModel<PiApi> {
+  return {
+    id: modelId,
+    name: modelId,
+    api: "openai-responses",
+    provider: "exo",
+    baseUrl: "",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 0,
+    maxTokens: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// StreamFn adapter: wraps Exo's existing ResponsesRuntimeLike.complete() so
+// pi's Agent drives the tool loop while Exo's model/secret/cost plumbing
+// (runtimeFromModelBinding, Braintrust tracing, price table) stays untouched.
+// ---------------------------------------------------------------------------
+
+export function createExoStreamFn(
+  runtime: ResponsesRuntimeLike,
+  exoModelId: string,
+): StreamFn {
+  return (model, context) => {
+    const stream = createAssistantMessageEventStream();
+    void (async () => {
+      try {
+        const request = piContextToNativeRequest(exoModelId, context);
+        const response = await runtime.complete(request);
+        const assistantMessage = responseToAssistantMessage(response, model);
+        stream.push({ type: "start", partial: assistantMessage });
+        stream.push({
+          type: "done",
+          reason: assistantMessage.stopReason as Extract<
+            AssistantMessage["stopReason"],
+            "stop" | "length" | "toolUse" | "deferred"
+          >,
+          message: assistantMessage,
+        });
+        stream.end(assistantMessage);
+      } catch (error) {
+        // Contract: streamFn must not throw or return a rejected promise -
+        // failures are encoded in the stream itself.
+        const errorMessage = buildErrorAssistantMessage(model, error);
+        stream.push({ type: "start", partial: errorMessage });
+        stream.push({ type: "error", reason: "error", error: errorMessage });
+        stream.end(errorMessage);
+      }
+    })();
+    return stream;
+  };
+}
+
+function piContextToNativeRequest(
+  model: string,
+  context: PiContext,
+): NativeResponsesRequest {
+  const messages: Message[] = [];
+  if (context.systemPrompt) {
+    messages.push({ role: "developer", content: context.systemPrompt });
+  }
+  for (const message of context.messages) {
+    messages.push(piMessageToExoMessage(message));
+  }
+  return {
+    model,
+    messages,
+    tools: (context.tools ?? []).map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      parameters: tool.parameters as unknown as JsonValue,
+    })),
+  };
+}
+
+function piMessageToExoMessage(message: PiMessage): Message {
+  if (message.role === "user") {
+    return { role: "user", content: piContentText(message.content) };
+  }
+  if (message.role === "assistant") {
+    // Preserve tool-call content blocks, not just text - dropping them here
+    // produces a message sequence a "tool" role message can't legally follow
+    // (no matching call to point back at), which surfaced as a real bug:
+    // the round after a tool call would silently fail and the turn would
+    // end early with no follow-up assistant message. Exo's own
+    // materializePromptMessages preserves the same shape when replaying a
+    // conversation's event log, so this matches what the runtime already
+    // expects.
+    return { role: "assistant", content: piAssistantContentParts(message) };
+  }
+  // role === "toolResult": use Exo's own tool-result message shape (matches
+  // what materializeEventsToMessages produces from a real tool_result event)
+  // instead of a synthetic user note, and carry through the original Exo
+  // ToolResult from AgentToolResult.details - toolInstanceToAgentTool sets
+  // details to exactly that value, and pi-agent-core's Agent copies it
+  // through onto the ToolResultMessage unchanged.
+  return toolResultMessage(
+    message.toolCallId,
+    message.toolName,
+    (message.details ?? piContentText(message.content)) as JsonValue,
+  );
+}
+
+function piAssistantContentParts(message: AssistantMessage): JsonValue[] {
+  const parts: JsonValue[] = [];
+  for (const part of message.content) {
+    if (part.type === "text" && part.text) {
+      parts.push({ type: "text", text: part.text });
+    } else if (part.type === "toolCall") {
+      parts.push({
+        type: "tool_call",
+        tool_call_id: part.id,
+        tool_name: part.name,
+        arguments: part.arguments as JsonValue,
+      });
+    }
+  }
+  return parts;
+}
+
+function piContentText(
+  content: string | (PiTextContent | PiImageContent)[],
+): string {
+  if (typeof content === "string") {
+    return content;
+  }
+  return content
+    .filter((part): part is PiTextContent => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+export function piAssistantText(message: AssistantMessage): string {
+  return message.content
+    .filter((part): part is PiTextContent => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
+function responseToAssistantMessage(
+  response: OpenAIResponse,
+  model: PiModel<PiApi>,
+): AssistantMessage {
+  const toolCalls = responseToolCalls(response);
+  const content: AssistantMessage["content"] = [];
+  // response.output_text is not reliably populated across runtimes -
+  // ChatCompletionsRuntime (used for OpenRouter and most non-OpenAI-Responses
+  // models) leaves it undefined and only fills response.output. Go through
+  // the same Lingua-backed extraction the original turn loop uses instead.
+  const text = responseMessages(response).map(messageText).join("");
+  if (text) {
+    content.push({ type: "text", text });
+  }
+  for (const call of toolCalls) {
+    content.push({
+      type: "toolCall",
+      id: call.toolCallId,
+      name: call.request.functionName,
+      arguments: call.request.arguments,
+    });
+  }
+  return {
+    role: "assistant",
+    content,
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: usageFromResponse(response),
+    stopReason: toolCalls.length > 0 ? "toolUse" : "stop",
+    timestamp: Date.now(),
+  };
+}
+
+function usageFromResponse(
+  response: OpenAIResponse,
+): AssistantMessage["usage"] {
+  const usage = response.usage;
+  const input = usage?.input_tokens ?? 0;
+  const output = usage?.output_tokens ?? 0;
+  const cacheRead = usage?.input_tokens_details?.cached_tokens ?? 0;
+  return {
+    input,
+    output,
+    cacheRead,
+    cacheWrite: 0,
+    totalTokens: input + output,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
+function buildErrorAssistantMessage(
+  model: PiModel<PiApi>,
+  error: unknown,
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [],
+    api: model.api,
+    provider: model.provider,
+    model: model.id,
+    usage: EMPTY_USAGE,
+    stopReason: "error",
+    errorMessage: error instanceof Error ? error.message : String(error),
+    timestamp: Date.now(),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Malformed-tool-call detection: benchmarking against a live free/weak model
+// (see harness-pi-core.ts) found it repeatedly emits its tool call as plain
+// text (e.g. "[TOOL_CALL shell] {...}" or a leaked "</minimax:tool_call>"
+// chat-template token) instead of a real structured tool call. When that
+// happens content has no "toolCall" part, so pi-agent-core's Agent sees a
+// turn with zero tool results and stops - unlike Exo's own turn loop, which
+// hits an explicit parse error from the model API and keeps looping until it
+// gets a real one. Same underlying model flakiness, different failure mode:
+// exo-bench fails loud and retries by construction; the pi-core-bench loop
+// exits quietly. This heuristic lets the harness recognize "that wasn't
+// actually a finished answer" and nudge a retry via agent.followUp() instead
+// of ending the turn early. False positives (a genuine final answer that
+// happens to mention "tool call") are the deliberate failure mode here - one
+// extra clarifying round costs far less than silently abandoning the task.
+// ---------------------------------------------------------------------------
+
+const MALFORMED_TOOL_CALL_TEXT_PATTERN = /tool[_ ]call/i;
+
+// Accepts a loose shape rather than pi-ai's AssistantMessage: the caller
+// receives pi-agent-core's AgentMessage, a union that also admits whatever
+// custom message types other packages declaration-merge into
+// CustomAgentMessages - not every member has a "content" array of the shape
+// AssistantMessage promises, so this checks defensively instead of trusting
+// the type.
+export function looksLikeMalformedToolCallAttempt(message: {
+  role: string;
+  content?: unknown;
+}): boolean {
+  if (message.role !== "assistant" || !Array.isArray(message.content)) {
+    return false;
+  }
+  const parts = message.content as Array<Record<string, unknown>>;
+  const hasRealToolCall = parts.some((part) => part?.type === "toolCall");
+  if (hasRealToolCall) {
+    return false;
+  }
+  const text = parts
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        part?.type === "text" && typeof part.text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+  return MALFORMED_TOOL_CALL_TEXT_PATTERN.test(text);
+}
+
+// ---------------------------------------------------------------------------
+// Event translation: pi AgentEvent -> Exo EventData[]. Mirrors the shape
+// exoharness/examples/typescript/pi-harness.ts already uses for the
+// subprocess integration (eventsForPiEvent) - same event names, because
+// pi-coding-agent's --mode json output is this same AgentEvent protocol
+// serialized to JSON lines. Only message_end and the tool_execution_*
+// pair carry anything Exo's event log needs to durably record.
+// ---------------------------------------------------------------------------
+
+export interface PiToolExecutionStartEvent {
+  type: "tool_execution_start";
+  toolCallId: string;
+  toolName: string;
+  args: unknown;
+}
+
+export interface PiToolExecutionEndEvent {
+  type: "tool_execution_end";
+  toolCallId: string;
+  toolName: string;
+  result: unknown;
+  isError: boolean;
+}
+
+export interface PiMessageEndEvent {
+  type: "message_end";
+  message: PiMessage;
+}
+
+export type PiRecordableEvent =
+  | PiToolExecutionStartEvent
+  | PiToolExecutionEndEvent
+  | PiMessageEndEvent;
+
+export function piEventToExoEvents(event: PiRecordableEvent): EventData[] {
+  if (event.type === "tool_execution_start") {
+    return [
+      toolRequestedEvent({
+        toolCallId: event.toolCallId,
+        request: {
+          functionName: event.toolName,
+          arguments: (event.args ?? {}) as JsonObject,
+        },
+      }),
+    ];
+  }
+  if (event.type === "tool_execution_end") {
+    return [
+      toolResultEvent(event.toolCallId, {
+        ok: !event.isError,
+        result: (event.result ?? null) as JsonValue,
+      }),
+    ];
+  }
+  if (event.message.role !== "assistant") {
+    return [];
+  }
+  const text = piAssistantText(event.message);
+  if (!text) {
+    return [];
+  }
+  return [
+    messagesEvent(
+      [assistantTextMessage(text)],
+      undefined,
+      usageToJsonObject(event.message.usage, event.message.model),
+    ),
+  ];
+}
+
+function usageToJsonObject(
+  usage: AssistantMessage["usage"],
+  model: string,
+): JsonObject {
+  return {
+    model,
+    prompt_tokens: usage.input,
+    completion_tokens: usage.output,
+    prompt_cached_tokens: usage.cacheRead,
+  };
+}

@@ -13,3 +13,4 @@ website/.wrangler
 .brain
 .exo/pi-cache
 exo/tools/extensions/.*--*.ts
+bench-results/
