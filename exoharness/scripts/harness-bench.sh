@@ -28,7 +28,7 @@ EXO=./target/debug/exo
 # whose prompt demands a bare number at the end grades the actual answer
 # rather than anything the model said while working.
 # ---------------------------------------------------------------------------
-CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug)
+CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline)
 
 case_tier() {
   case "$1" in
@@ -36,6 +36,7 @@ case_tier() {
     t2-*) echo "2-single-tool" ;;
     t3-*) echo "3-multi-round" ;;
     t4-*) echo "4-debug-loop" ;;
+    t5-*) echo "5-long-multistep" ;;
   esac
 }
 
@@ -48,6 +49,8 @@ case_expect() {
     t3-counter)  echo '(^|[^0-9])5([^0-9]|$)' ;;
     t3-fizzbuzz) echo '(^|[^0-9])5([^0-9]|$)' ;;
     t4-fixbug)   echo '(^|[^0-9])6([^0-9]|$)' ;;
+    t5-multifile) echo '(^|[^0-9])3/3([^0-9]|$)' ;;
+    t5-pipeline)  echo '(^|[^0-9])10([^0-9]|$)' ;;
   esac
 }
 
@@ -75,6 +78,10 @@ done
 echo \$total
 
 Then run it with bash. It contains a deliberate syntax error. Read the error output, fix the script, re-run it until it works, and finish your reply with the number it finally prints, as a bare number on its own line." ;;
+    t5-multifile)
+      echo "In /tmp/proj, build a tiny bash calculator library across two files: lib.sh defining three functions add(), sub(), mul() (each takes two args and echoes the arithmetic result using \$((...))), and test.sh that sources lib.sh and runs exactly 3 checks: add 2 3 should print 5, sub 10 4 should print 6, mul 3 3 should print 9. test.sh should print PASS or FAIL per check and a final summary line in the exact form 'N/3 passed'. Run test.sh. If any check fails, find and fix the bug (it may be in lib.sh or in test.sh's expected values), then re-run test.sh until it reports 3/3 passed. Finish your reply with that exact final summary line, nothing else added after it." ;;
+    t5-pipeline)
+      echo "In /tmp/proj2, build a 3-stage bash pipeline as 3 separate scripts, running each one with a separate tool call in order: gen.sh writes the integers 1 through 20, one per line, to raw.txt. filter.sh reads raw.txt and writes only the even numbers, one per line, to filtered.txt. count.sh reads filtered.txt and writes the number of lines in it to result.txt. Run gen.sh, then filter.sh, then count.sh, each as its own tool call - do not combine them into one command. Then cat result.txt. Finish your reply with the number from result.txt as a bare number on its own line." ;;
   esac
 }
 
