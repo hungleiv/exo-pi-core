@@ -177,7 +177,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::local_test_config;
-    use crate::{AgentHarnessKind, AgentSandboxConfig, SandboxScope};
+    use crate::{AgentHarnessKind, AgentSandboxConfig, ConversationConfig, SandboxScope};
 
     async fn test_agent(tempdir: &TempDir) -> std::sync::Arc<dyn AgentHandle> {
         let exoharness = BasicExoHarness::new(local_test_config(tempdir.path().join("exoharness")))
@@ -287,5 +287,65 @@ mod tests {
         let spec = agent_sandbox_spec(&agent_config);
         assert_eq!(spec.default_workdir, "/workspace/exo");
         assert_eq!(spec.file_system_mounts, vec![mount]);
+    }
+
+    // An agent mount used to reach the agent-scoped sandbox only. A
+    // conversation-scoped sandbox derived its mounts from the conversation
+    // config alone, so `exo agent mount add` was silently dropped for every
+    // agent that did not run agent-scoped - including every custom TypeScript
+    // harness, whose lazy sandbox creation goes through this same spec.
+    #[tokio::test]
+    async fn agent_mounts_reach_the_conversation_sandbox_spec() {
+        let tempdir = TempDir::new().unwrap();
+        let mount = FileSystemMount {
+            host_path: tempdir.path().display().to_string(),
+            mount_path: "/workspace/exo".to_string(),
+            mode: FileSystemMountMode::ReadWrite,
+            internal: Some(false),
+        };
+        let mut sandbox = test_sandbox_config(None);
+        sandbox.mounts = vec![mount.clone()];
+        let agent_config = test_agent_config(sandbox);
+        let conversation_config = ConversationConfig::default();
+
+        let spec = crate::conversation_sandbox::conversation_sandbox_spec(
+            &agent_config,
+            &conversation_config,
+        );
+        assert_eq!(spec.default_workdir, "/workspace/exo");
+        assert_eq!(spec.file_system_mounts, vec![mount]);
+    }
+
+    // The conversation's own mounts still win when it declares any, matching
+    // how effective_sandbox_image and effective_sandbox_provider behave.
+    #[tokio::test]
+    async fn conversation_mounts_override_agent_mounts() {
+        let tempdir = TempDir::new().unwrap();
+        let agent_mount = FileSystemMount {
+            host_path: tempdir.path().display().to_string(),
+            mount_path: "/workspace/exo".to_string(),
+            mode: FileSystemMountMode::ReadWrite,
+            internal: Some(false),
+        };
+        let conversation_mount = FileSystemMount {
+            host_path: tempdir.path().display().to_string(),
+            mount_path: "/workspace/other".to_string(),
+            mode: FileSystemMountMode::ReadOnly,
+            internal: Some(false),
+        };
+        let mut sandbox = test_sandbox_config(None);
+        sandbox.mounts = vec![agent_mount];
+        let agent_config = test_agent_config(sandbox);
+        let conversation_config = ConversationConfig {
+            mounts: vec![conversation_mount.clone()],
+            ..Default::default()
+        };
+
+        let spec = crate::conversation_sandbox::conversation_sandbox_spec(
+            &agent_config,
+            &conversation_config,
+        );
+        assert_eq!(spec.default_workdir, "/workspace/other");
+        assert_eq!(spec.file_system_mounts, vec![conversation_mount]);
     }
 }

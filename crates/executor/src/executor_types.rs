@@ -148,6 +148,20 @@ impl ConversationConfig {
             .clone()
             .unwrap_or_else(|| agent_config.sandbox.provider.clone())
     }
+
+    // Conversation mounts override agent mounts wholesale rather than merging:
+    // a conversation that declares its own mount set is saying "this is the
+    // filesystem I want", and silently union-ing the agent's mounts into it
+    // could reintroduce a path the conversation deliberately left out. Empty
+    // means "unspecified", which is the same rule the image and provider
+    // helpers above already follow.
+    pub fn effective_mounts<'a>(&'a self, agent_config: &'a AgentConfig) -> &'a [FileSystemMount] {
+        if self.mounts.is_empty() {
+            &agent_config.sandbox.mounts
+        } else {
+            &self.mounts
+        }
+    }
 }
 
 #[async_trait]

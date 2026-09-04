@@ -237,7 +237,7 @@ pub(crate) fn conversation_sandbox_spec(
             .map(str::to_string)
             .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string()),
         default_workdir: config
-            .mounts
+            .effective_mounts(agent_config)
             .first()
             .map(|mount| mount.mount_path.clone())
             .or_else(|| {
@@ -247,7 +247,10 @@ pub(crate) fn conversation_sandbox_spec(
                     .map(|file_system| file_system.mount_path.clone())
             })
             .unwrap_or_else(|| "/".to_string()),
-        file_system_mounts: normalize_mounts(&config.mounts),
+        // Same fallback the image and provider fields above already use: a
+        // conversation-scoped sandbox still belongs to an agent, so an agent
+        // mount applies unless the conversation declares its own.
+        file_system_mounts: normalize_mounts(config.effective_mounts(agent_config)),
         durable_file_systems: config.durable_file_systems.clone(),
         enable_networking: agent_config.sandbox.enable_networking,
         idle_seconds: 300,

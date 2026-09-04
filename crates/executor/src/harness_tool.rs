@@ -953,8 +953,13 @@ pub(crate) async fn ensure_shell_sandbox(
     if let Some(sandbox_id) = attached_conversation_sandbox(conversation).await? {
         return Ok(sandbox_id);
     }
-    let desired_default_workdir = config
-        .mounts
+    // Agent-level mounts (exo agent mount add) have to be honoured here, not
+    // just conversation-level ones: with a custom TypeScript harness the tool
+    // runtime's prepare_conversation is a no-op, so this lazy path is the only
+    // place the sandbox ever gets created, and reading config.mounts alone
+    // dropped the agent's mounts silently.
+    let effective_mounts = config.effective_mounts(agent_config);
+    let desired_default_workdir = effective_mounts
         .first()
         .map(|mount| mount.mount_path.clone())
         .or_else(|| {
@@ -964,7 +969,7 @@ pub(crate) async fn ensure_shell_sandbox(
                 .map(|file_system| file_system.mount_path.clone())
         })
         .unwrap_or_else(|| "/".to_string());
-    let desired_mounts = normalize_mounts(&config.mounts);
+    let desired_mounts = normalize_mounts(effective_mounts);
     let desired_durable_file_systems = config.durable_file_systems.clone();
     let desired_provider = config.effective_sandbox_provider(agent_config);
     // Empty means "unspecified"; the harness fills the provider's default.
