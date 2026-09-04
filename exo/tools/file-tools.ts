@@ -215,7 +215,13 @@ async function readFile(
   path: string,
 ): Promise<string> {
   const quotedPath = shellQuote(path);
-  const command = `base64 < ${quotedPath} | tr -d '\\n'`;
+  // Without pipefail, a pipeline's exit code is the *last* command's - and
+  // `tr` succeeds even on empty input, so a failing `base64` (e.g. missing
+  // file) was silently swallowed as an empty read instead of an error. This
+  // is exactly what happened in the first live Case 1 RSI run: the model
+  // read a "" body for a file that actually had content, and then
+  // overwrote it thinking it was empty.
+  const command = `set -o pipefail && base64 < ${quotedPath} | tr -d '\\n'`;
   const outcome = await runShell(execution, command);
   if (outcome.exitCode !== 0) {
     throw new Error(
