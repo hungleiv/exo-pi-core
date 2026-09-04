@@ -144,18 +144,26 @@ describe("loadPiExtension", () => {
       extensionPath,
       `
       export default function (pi) {
+        let seenExecution = false;
+        let ranBefore = false;
         pi.on("tool_call", (event, execution) => {
-          pi.seenExecution = execution && execution.context !== undefined;
+          seenExecution = execution !== undefined && execution.context !== undefined;
           if (event.args.dangerous === true) {
             return { block: true, reason: "dangerous flag set" };
           }
-          return { before: async () => { pi.ranBefore = true; } };
+          return { before: async () => { ranBefore = true; } };
         });
         pi.registerTool({
           name: "guarded",
           description: "guarded tool",
           parameters: { type: "object", additionalProperties: false, properties: { dangerous: { type: ["boolean", "null"] } }, required: ["dangerous"] },
-          execute: (args) => ({ ok: true, ran: true, dangerous: args.dangerous === true }),
+          execute: (args) => ({
+            ok: true,
+            ran: true,
+            dangerous: args.dangerous === true,
+            seenExecution,
+            ranBefore,
+          }),
         });
       }
       `,
@@ -183,7 +191,12 @@ describe("loadPiExtension", () => {
       )) as JsonObject;
     // The before hook ran ahead of the handler and the listener saw the
     // execution context (policy has the same reach as a native tool).
-    expect(allowed).toMatchObject({ ok: true, ran: true });
+    expect(allowed).toMatchObject({
+      ok: true,
+      ran: true,
+      seenExecution: true,
+      ranBefore: true,
+    });
   });
 
   it("enforces setActiveTools at registration time", async () => {

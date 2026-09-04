@@ -87,8 +87,8 @@ export interface PiListenerExecutionContext {
 }
 
 // A listener may return a decision instead of undefined. `block` vetoes the
-// tool call before the handler runs; `snapshotFirst` runs an arbitrary
-// async preparation (e.g. capture a sandbox snapshot) before executing.
+// tool call before the handler runs; `before` runs an arbitrary async
+// preparation (e.g. capture a sandbox snapshot) before executing.
 export interface PiToolCallDecision {
   block?: boolean;
   reason?: string;
