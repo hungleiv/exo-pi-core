@@ -63,7 +63,7 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
   const tools = createToolRegistry(context);
   await registerExoTools(tools, context);
 
-  const instructions = await exoInstructions(context);
+  const instructions = await exoInstructions(context, tools);
   const materialized = await materializePromptMessages(
     context.exoharness.current.conversation,
     instructions,
