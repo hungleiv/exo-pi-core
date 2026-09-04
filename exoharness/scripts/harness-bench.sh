@@ -67,7 +67,7 @@ case_prompt() {
     t3-counter)
       echo "In /tmp/bx, create counter.txt containing 0. Then, one shell call at a time and never combining steps, read the current number, add exactly 1, and write it back. Do that single-increment cycle 5 separate times as 5 separate tool calls. Then cat counter.txt and finish your reply with the final number as a bare number on its own line." ;;
     t3-fizzbuzz)
-      echo "Write /tmp/bx/fizz.sh that prints FizzBuzz for the numbers 1 to 15 (Fizz for multiples of 3, Buzz for multiples of 5, FizzBuzz for both, otherwise the number). Run it, then use grep -c to count how many of its output lines contain the word Fizz. Finish your reply with that count as a bare number on its own line." ;;
+      echo "Write /tmp/bx/fizz.sh that prints FizzBuzz for the numbers 1 to 15 (Fizz for multiples of 3, Buzz for multiples of 5, FizzBuzz for both, otherwise the number). Run it, then use grep -c to count how many of its output lines contain Fizz as a substring - a FizzBuzz line counts as one of them. Finish your reply with that count as a bare number on its own line." ;;
     t4-fixbug)
       printf '%s' "Create /tmp/bx/buggy.sh with exactly this content:
 #!/bin/bash
@@ -129,7 +129,9 @@ collect() {
       tool_errors: ([.events[] | select(.data.type=="tool_result")
                      | select((.data.result.ok? == false) or (.data.result.is_error? == true))] | length),
       prompt_tokens: ([.events[] | select(.data.type=="messages") | .data.usage.prompt_tokens? // 0] | add // 0),
-      completion_tokens: ([.events[] | select(.data.type=="messages") | .data.usage.completion_tokens? // 0] | add // 0)
+      completion_tokens: ([.events[] | select(.data.type=="messages") | .data.usage.completion_tokens? // 0] | add // 0),
+      nudges: ([.events[] | select(.data.type=="artifact_written")
+                | select((.data.path? // "") | startswith("pi-core/nudge-"))] | length)
     }'
 }
 
@@ -152,7 +154,7 @@ for agent in "${AGENT_LIST[@]}"; do
       end=$(( $(date +%s%N) / 1000000 ))
 
       metrics="$(collect "$agent" "$slug")"
-      [[ -z "$metrics" ]] && metrics='{"final":"","rounds":0,"tool_errors":0,"prompt_tokens":0,"completion_tokens":0}'
+      [[ -z "$metrics" ]] && metrics='{"final":"","rounds":0,"tool_errors":0,"prompt_tokens":0,"completion_tokens":0,"nudges":0}'
       final="$(echo "$metrics" | jq -r '.final')"
 
       if echo "$final" | grep -Eq "$expect"; then pass=true; else pass=false; fi
@@ -161,13 +163,14 @@ for agent in "${AGENT_LIST[@]}"; do
         --arg agent "$agent" --arg case "$case_id" --arg tier "$(case_tier "$case_id")" \
         --argjson rep "$rep" --argjson pass "$pass" --argjson ms "$((end - start))" \
         '{agent: $agent, case: $case, tier: $tier, rep: $rep, pass: $pass, ms: $ms,
-          rounds, tool_errors, prompt_tokens, completion_tokens,
+          rounds, tool_errors, prompt_tokens, completion_tokens, nudges,
           final: (.final | gsub("\\s+"; " ") | .[0:120])}' >> "$OUT"
 
-      printf '%-16s %-12s rep%-2s pass=%-5s rounds=%-3s errs=%-3s %ss\n' \
+      printf '%-18s %-12s rep%-2s pass=%-5s rounds=%-3s errs=%-3s nudges=%-3s %ss\n' \
         "$agent" "$case_id" "$rep" "$pass" \
         "$(echo "$metrics" | jq -r '.rounds')" \
         "$(echo "$metrics" | jq -r '.tool_errors')" \
+        "$(echo "$metrics" | jq -r '.nudges')" \
         "$(( (end - start) / 1000 ))"
     done
   done
@@ -182,8 +185,9 @@ jq -s -r '
      passed: ([.[] | select(.pass)] | length),
      avg_rounds: (([.[] | .rounds] | add) / length),
      tool_errors: ([.[] | .tool_errors] | add),
+     nudges: ([.[] | .nudges // 0] | add),
      avg_s: ((([.[] | .ms] | add) / length / 1000) | floor)}
-  | "\(.agent | .[0:16] | . + "                " | .[0:16]) \(.tier | . + "              " | .[0:14]) pass \(.passed)/\(.runs)  avg_rounds \(.avg_rounds)  tool_errors \(.tool_errors)  avg \(.avg_s)s"
+  | "\(.agent | .[0:18] | . + "                  " | .[0:18]) \(.tier | . + "              " | .[0:14]) pass \(.passed)/\(.runs)  avg_rounds \(.avg_rounds)  tool_errors \(.tool_errors)  nudges \(.nudges)  avg \(.avg_s)s"
 ' "$OUT"
 
 echo

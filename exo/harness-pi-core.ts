@@ -35,6 +35,7 @@ import { runtimeFromModelBinding } from "@exo/model-runtime/responses";
 import { appendEvents, resolveLlmBinding } from "@exo/model-runtime/shared";
 
 import { exoInstructions, registerExoTools } from "./harness";
+import { FILE_TOOLS_INSTRUCTION, registerFileTools } from "./tools/file-tools";
 import {
   buildModelStub,
   createExoStreamFn,
@@ -61,11 +62,32 @@ export default defineHarness({
   },
 });
 
-async function runPiCoreTurn(context: TurnContext): Promise<void> {
+export interface PiCoreTurnOptions {
+  // Register the write/edit/read tools from exo/tools/file-tools.ts on top of
+  // Exo's shell-only built-ins. Off by default so this harness stays a pure
+  // "same tools, different loop" comparison against exo/harness.ts; the
+  // variant that turns it on lives in harness-pi-core-files.ts, which keeps
+  // the two variables (loop, tool surface) separable in benchmarks.
+  fileTools?: boolean;
+}
+
+export async function runPiCoreTurn(
+  context: TurnContext,
+  options: PiCoreTurnOptions = {},
+): Promise<void> {
   const tools = createToolRegistry(context);
   await registerExoTools(tools, context);
+  if (options.fileTools) {
+    registerFileTools(tools);
+  }
 
   const instructions = await exoInstructions(context, tools);
+  if (options.fileTools) {
+    instructions.push({
+      role: "developer",
+      content: FILE_TOOLS_INSTRUCTION,
+    });
+  }
   const materialized = await materializePromptMessages(
     context.exoharness.current.conversation,
     instructions,
@@ -158,6 +180,25 @@ async function runPiCoreTurn(context: TurnContext): Promise<void> {
       looksLikeUnfinishedTurn(event.message)
     ) {
       unfinishedTurnNudges += 1;
+      // Instrumentation, not behaviour: one artifact per nudge so a benchmark
+      // can count how often this recovery path actually fires (jq over
+      // artifact_written events whose path starts with "pi-core/nudge-").
+      // Whether this hand-written nudge is still earning its place once
+      // file-tools remove the main source of botched turns is an empirical
+      // question, and it was previously unmeasurable. Failing to record must
+      // never cost a turn, hence the swallowed error.
+      try {
+        await context.exoharness.current.turn.writeArtifactText({
+          path: `pi-core/nudge-${unfinishedTurnNudges}.json`,
+          text: JSON.stringify({
+            nudge: unfinishedTurnNudges,
+            reason: "unfinished-turn",
+            at: new Date().toISOString(),
+          }),
+        });
+      } catch {
+        // Instrumentation is best-effort.
+      }
       agent.followUp({
         role: "user",
         content:
