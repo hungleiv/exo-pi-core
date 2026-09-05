@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# One monitoring tick: scan for anomalies, and only wake an agent when there is
+# something to look at.
+#
+# Deliberately event-driven rather than a scheduled model call. A cron entry
+# that prompts a model every 30 minutes pays for a model call 48 times a day to
+# usually be told "nothing happened"; this pays only when the scan actually
+# finds something. That matters here - this whole monitoring layer exists
+# because a single unnoticed runaway loop burned ~$9, and a watchdog that
+# itself costs more than the incidents it catches is not worth running.
+#
+# Install (every 15 minutes):
+#   crontab -e
+#   */15 * * * * /home/nivo/exo/exo/scripts/exo-monitor-tick >> /home/nivo/exo/.exo/exo-monitor.log 2>&1
+#
+# Usage: exo-monitor-tick [--dry-run] [--since-hours N]
+#   --dry-run       print findings, never send them to the agent (no model cost)
+#   --since-hours   scan window, default 2 (overlaps a 15-minute cron cadence
+#                   generously, so nothing falls between ticks)
+
+set -uo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+EXO_BIN="${ROOT_DIR}/target/debug/exo"
+SCAN_SCRIPT="${ROOT_DIR}/exo/scripts/exo-anomaly-scan.mjs"
+MONITOR_AGENT="exo-monitor"
+STATE_FILE="${ROOT_DIR}/.exo/exo-monitor-last-report.txt"
+
+SINCE_HOURS=2
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    --since-hours) SINCE_HOURS="${2:-2}"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$ROOT_DIR" || exit 1
+
+findings="$(node "$SCAN_SCRIPT" --since-hours "$SINCE_HOURS" 2>&1)"
+scan_status=$?
+
+if [[ $scan_status -eq 0 ]]; then
+  echo "[$(date -Is)] clean"
+  exit 0
+fi
+
+# Don't re-report an identical finding set every tick: a runaway conversation
+# stays in the scan window for hours, and waking the agent on every tick for
+# the same thing is exactly the kind of cost leak this script exists to avoid.
+if [[ -f "$STATE_FILE" ]] && [[ "$findings" == "$(cat "$STATE_FILE")" ]]; then
+  echo "[$(date -Is)] findings unchanged since last report, not re-sending"
+  exit 0
+fi
+
+echo "[$(date -Is)] anomalies found:"
+echo "$findings"
+
+if [[ $DRY_RUN -eq 1 ]]; then
+  echo "[$(date -Is)] dry-run: not sending to $MONITOR_AGENT"
+  exit 0
+fi
+
+conversation="watch-$(date +%Y%m%d-%H%M%S)"
+"$EXO_BIN" conversation create "$MONITOR_AGENT" "$conversation" >/dev/null 2>&1
+
+# The agent has rebuild_and_restart_exo available, so the prompt is explicit
+# about not using it: a watchdog that silently rewrites and restarts the system
+# it is watching, unattended, is a much bigger risk than the loops it catches.
+# Diagnosis is the job; a human decides whether to act on it.
+# The scan already carries the evidence that matters (streak length, the error
+# text, round counts), so the default path needs no digging at all. That is
+# deliberate: the first version of this prompt told the agent to go inspect the
+# event directories, and it ran `ls -la` against a directory holding 800+ event
+# files, blew out its own context, and returned an empty turn. Small models
+# investigating large event stores need the evidence handed to them.
+prompt="An automated scan of this Exo instance's event log found anomalies. Its output already includes the failure counts and the error text, so you normally do not need to open any files.
+
+Scan output:
+${findings}
+
+Reply with a short report (under 12 lines): what happened, whether it still looks ongoing, roughly what it cost, and what you recommend.
+
+If one finding is genuinely unclear, you may look at it with shell under /workspace/exo/.exo/exoharness/agents/<agentId>/conversations/<conversationId>/events/ - but only with commands that return a handful of lines (grep with head, never a bare ls: some of these directories hold 800+ files and will bury your own context).
+
+Do NOT modify any code and do NOT call rebuild_and_restart_exo - diagnosis only, a human decides what to change."
+
+if "$EXO_BIN" conversation send "$MONITOR_AGENT" "$conversation" "$prompt" 2>&1; then
+  printf '%s' "$findings" > "$STATE_FILE"
+  echo "[$(date -Is)] reported to $MONITOR_AGENT/$conversation"
+else
+  echo "[$(date -Is)] failed to reach $MONITOR_AGENT; leaving state unchanged so the next tick retries" >&2
+  exit 1
+fi
