@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   buildShellToolDefinitions,
+  buildTruncatedPreview,
   createShellToolInstance,
   createToolRegistry,
   initializeTool,
@@ -220,15 +221,10 @@ describe("HarnessToolRegistry", () => {
           },
         ],
         truncated: true,
-        preview: `${JSON.stringify(
-          {
-            stdout,
-            stderr: "",
-            exit_code: 0,
-          },
-          null,
-          2,
-        ).slice(0, 4_000)}\n...[truncated]`,
+        preview: buildTruncatedPreview(
+          JSON.stringify({ stdout, stderr: "", exit_code: 0 }, null, 2),
+          { stdout, stderr: "", exit_code: 0 },
+        ),
         value: null,
       }),
     ]);
@@ -419,7 +415,8 @@ describe("shell built-in tool", () => {
     ).toEqual([
       {
         name: "shell",
-        description: "Run a shell command using /bin/bash.",
+        description:
+          "Run a shell command using /bin/bash. Long output is truncated before you see it; when that happens the result carries full_output_path, a file inside the sandbox holding the complete output - read that file (or grep/tail it) instead of assuming the truncated text is everything.",
         parameters: {
           type: "object",
           additionalProperties: false,
@@ -484,6 +481,99 @@ describe("shell built-in tool", () => {
       stderr: "",
       exit_code: 0,
     });
+  });
+
+  // Without this, output past the preview is unreachable: the full text goes
+  // only to a host-side artifact that no tool can read and that isn't
+  // mounted into the sandbox. Measured live before the fix - asked for the
+  // last line of a 70KB output, the model answered with a line from the top.
+  it("spills large shell output to a sandbox file the model can read back", async () => {
+    const commands: string[] = [];
+    const big = "filler-line\n".repeat(1_000);
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        const command = String(
+          (request.arguments as { command?: unknown }).command,
+        );
+        commands.push(command);
+        if (command.startsWith("mkdir -p --")) {
+          return { stdout: "", stderr: "", exit_code: 0 };
+        }
+        return { stdout: big, stderr: "", exit_code: 0 };
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "seq 1 1000" },
+      { context, toolCallId: "call_big" },
+    )) as JsonObject;
+
+    expect(result.full_output_path).toBe("/tmp/exo-shell-output/call_big.log");
+    expect(result.full_output_chars).toBe(big.length);
+    expect(commands.some((c) => c.includes("base64 -d"))).toBe(true);
+
+    // The pointer has to survive truncation, not just exist. tools.ts builds
+    // the model-visible preview by slicing the serialized result at
+    // TOOL_RESULT_PREVIEW_CHARS, so a key placed after the large stdout is
+    // cut off and the model never learns the file is there. That is the
+    // shape of the original bug: the spill file was written correctly on
+    // every live run and full_output_path still never reached the model.
+    const previewCharsInToolsTs = 4_000;
+    const preview = JSON.stringify(result, null, 2).slice(
+      0,
+      previewCharsInToolsTs,
+    );
+    expect(preview).toContain("full_output_path");
+    expect(preview).toContain("/tmp/exo-shell-output/call_big.log");
+  });
+
+  // Head-only truncation silently drops the end of a large output, which is
+  // where a command's answer usually is. Tail-only (what Pi does) drops the
+  // beginning instead. Both ends have to survive.
+  it("keeps both ends of an over-long tool result", () => {
+    const text = `START-MARKER${"x".repeat(50_000)}END-MARKER`;
+    const preview = buildTruncatedPreview(text, {
+      full_output_path: "/tmp/exo-shell-output/call_x.log",
+      full_output_chars: text.length,
+    });
+
+    expect(preview).toContain("START-MARKER");
+    expect(preview).toContain("END-MARKER");
+    expect(preview).toContain("truncated");
+    expect(preview).toContain("/tmp/exo-shell-output/call_x.log");
+    expect(preview.length).toBeLessThan(text.length);
+  });
+
+  it("returns short tool results unchanged", () => {
+    expect(buildTruncatedPreview("small", {})).toBe("small");
+  });
+
+  it("leaves small shell output untouched", async () => {
+    const commands: string[] = [];
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        commands.push(
+          String((request.arguments as { command?: unknown }).command),
+        );
+        return { stdout: "small\n", stderr: "", exit_code: 0 };
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "echo small" },
+      { context, toolCallId: "call_small" },
+    )) as JsonObject;
+
+    expect(result.full_output_path).toBeUndefined();
+    expect(commands).toHaveLength(1);
   });
 
   it("registers requested built-in tools", () => {

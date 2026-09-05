@@ -8,7 +8,11 @@ import type {
   ToolResult,
   TurnContext,
 } from "./index";
-import type { HarnessToolRegistry, ToolInstance } from "./tools";
+import type {
+  HarnessToolRegistry,
+  ToolExecutionContext,
+  ToolInstance,
+} from "./tools";
 import {
   DEFAULT_AGENT_TOOL_DIRECTORY,
   findAgentToolNameConflict,
@@ -53,6 +57,15 @@ export function registerBuiltInTools(
   }
 }
 
+// Output past this is worth spilling to a file the model can read back.
+// Matches TOOL_RESULT_PREVIEW_CHARS in tools.ts - the point where the model
+// stops seeing the rest of the result.
+const SHELL_OUTPUT_SPILL_THRESHOLD_CHARS = 4_000;
+// Ceiling on what gets written back, since the spill travels as a base64
+// argument on a second shell call. Anything past this stays artifact-only.
+const SHELL_OUTPUT_SPILL_LIMIT_CHARS = 1_000_000;
+const SHELL_OUTPUT_SPILL_DIR = "/tmp/exo-shell-output";
+
 export function createShellToolInstance(
   config: ConversationConfig,
 ): ToolInstance | null {
@@ -63,14 +76,107 @@ export function createShellToolInstance(
     source: "built_in",
     definition: shellToolDefinition(config.shellProgram),
     handler: {
-      execute(args, execution) {
-        return execution.context.executeTool({
+      async execute(args, execution) {
+        const result = await execution.context.executeTool({
           functionName: "shell",
           arguments: args,
         });
+        return await attachSpilledOutputPath(execution, result);
       },
     },
   };
+}
+
+// Large shell output is truncated to a preview before the model sees it, and
+// the full text only reaches a host-side artifact - which no tool can read,
+// and which is not mounted into the sandbox. Measured directly: asked for
+// the last line of a 70KB output, the model answered with a line from the
+// top, because everything past the preview was unreachable to it. Real Pi
+// does not have this problem because its bash tool leaves the whole output
+// in a sandbox file (/tmp/pi-bash-<id>.log) that its read tool can page
+// through. This does the same thing for Exo's shell tool.
+//
+// Deliberately done after the command runs, rather than by wrapping the
+// command in a tee/redirect: rewriting the command would change exit-code
+// propagation through pipes, merge or reorder stdout/stderr, and buffer the
+// live process-event stream that long-running commands rely on.
+async function attachSpilledOutputPath(
+  execution: ToolExecutionContext,
+  result: ToolResult,
+): Promise<ToolResult> {
+  if (!isRecord(result)) {
+    return result;
+  }
+  // The shell result arrives in more than one shape depending on the call
+  // path (bare, or nested under value/details) - file-tools.ts's
+  // normalizeShellResult already had to account for the same thing. Reading
+  // only the top level silently skipped every spill on the pi-core path.
+  const shell = shellOutputRecord(result);
+  const stdout = typeof shell?.stdout === "string" ? shell.stdout : "";
+  const stderr = typeof shell?.stderr === "string" ? shell.stderr : "";
+  const combined = stdout.length + stderr.length;
+  if (
+    combined <= SHELL_OUTPUT_SPILL_THRESHOLD_CHARS ||
+    combined > SHELL_OUTPUT_SPILL_LIMIT_CHARS
+  ) {
+    return result;
+  }
+
+  const body = stderr.length > 0 ? `${stdout}\n[stderr]\n${stderr}` : stdout;
+  const spillPath = `${SHELL_OUTPUT_SPILL_DIR}/${sanitizeSpillSegment(execution.toolCallId ?? "call")}.log`;
+  const encoded = Buffer.from(body, "utf8").toString("base64");
+  const quotedPath = shellSingleQuote(spillPath);
+  try {
+    const write = await execution.context.executeTool({
+      functionName: "shell",
+      arguments: {
+        command:
+          `mkdir -p -- ${shellSingleQuote(SHELL_OUTPUT_SPILL_DIR)} && ` +
+          `printf %s ${shellSingleQuote(encoded)} | base64 -d > ${quotedPath}`,
+      },
+    });
+    if (isRecord(write) && write.exit_code !== 0) {
+      return result;
+    }
+  } catch {
+    // The spill is a convenience; never fail the command over it.
+    return result;
+  }
+  // Order matters. tools.ts previews a result by slicing its serialized JSON
+  // at TOOL_RESULT_PREVIEW_CHARS, so any key sitting after the large stdout
+  // is cut off before the model reads it - which is what happened when these
+  // two were spread in last: the file was written correctly every time, and
+  // the pointer to it never survived truncation. Leading with them keeps the
+  // pointer inside the preview no matter how big the output is.
+  return {
+    full_output_path: spillPath,
+    full_output_chars: combined,
+    ...result,
+  };
+}
+
+function shellOutputRecord(result: JsonObject): JsonObject | null {
+  for (const candidate of [result, result.value, result.details]) {
+    if (
+      isRecord(candidate) &&
+      (typeof candidate.stdout === "string" ||
+        typeof candidate.stderr === "string")
+    ) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+// Tool call ids come from the model API, so they reach a sandbox path here:
+// keep them to characters that need no quoting beyond the single-quoting
+// above, matching the same sanitizer tools.ts applies to artifact paths.
+function sanitizeSpillSegment(value: string): string {
+  return value.replace(/[^A-Za-z0-9_.-]+/g, "_").slice(0, 96) || "call";
 }
 
 export function buildShellToolDefinitions(
@@ -83,7 +189,7 @@ export function buildShellToolDefinitions(
 function shellToolDefinition(shellProgram: string): ToolDefinition {
   return {
     name: "shell",
-    description: `Run a shell command using ${shellProgram}.`,
+    description: `Run a shell command using ${shellProgram}. Long output is truncated before you see it; when that happens the result carries full_output_path, a file inside the sandbox holding the complete output - read that file (or grep/tail it) instead of assuming the truncated text is everything.`,
     parameters: {
       type: "object",
       additionalProperties: false,

@@ -13,6 +13,9 @@ export type HarnessToolSource = "built_in" | "library" | "agent";
 
 const TOOL_RESULT_INLINE_LIMIT_CHARS = 8_000;
 const TOOL_RESULT_PREVIEW_CHARS = 4_000;
+// The preview budget, split so both ends of a truncated result survive.
+const TOOL_RESULT_PREVIEW_HEAD_CHARS = 2_600;
+const TOOL_RESULT_PREVIEW_TAIL_CHARS = 1_400;
 
 export interface ToolExecutionContext {
   readonly context: TurnContext;
@@ -189,7 +192,7 @@ async function compactToolResult(
     resultArtifact: fullResultArtifact,
     artifacts: [fullResultArtifact, ...shellArtifacts],
     truncated: serialized.length > TOOL_RESULT_INLINE_LIMIT_CHARS,
-    preview: previewText(serialized),
+    preview: previewText(serialized, args.result),
     value,
   };
 }
@@ -258,10 +261,65 @@ function stringifyToolResult(result: ToolResult): string {
   return typeof result === "string" ? result : JSON.stringify(result, null, 2);
 }
 
-function previewText(text: string): string {
-  return text.length > TOOL_RESULT_PREVIEW_CHARS
-    ? `${text.slice(0, TOOL_RESULT_PREVIEW_CHARS)}\n...[truncated]`
-    : text;
+function previewText(text: string, result: ToolResult): string {
+  return buildTruncatedPreview(text, result);
+}
+
+// Keeps BOTH ends of an over-long result instead of just the head.
+//
+// This was head-only, which quietly loses whatever sits at the end of a large
+// output - and the end is where a command's answer usually is (the last line,
+// the summary, the error that stopped it). Measured: asked for the last line
+// of a 70KB output, the model confidently answered with a line from the top.
+// Real Pi has the mirror-image bug, truncating tail-first, so it loses the
+// beginning of long listings instead; it only looked better on the last-line
+// probe because that question happens to favour its direction, not because it
+// recovered anything.
+//
+// Splitting one budget across both ends dominates either single-ended choice:
+// the two places answers actually live are preserved, the elision marker in
+// the middle states how much is missing, and - for shell output - it names
+// the sandbox file holding the complete text so the gap is recoverable rather
+// than merely disclosed.
+export function buildTruncatedPreview(
+  text: string,
+  result: unknown,
+  extraNote?: string,
+): string {
+  if (text.length <= TOOL_RESULT_PREVIEW_CHARS) {
+    return text;
+  }
+  const head = text.slice(0, TOOL_RESULT_PREVIEW_HEAD_CHARS);
+  const tail = text.slice(text.length - TOOL_RESULT_PREVIEW_TAIL_CHARS);
+  const omitted = text.length - head.length - tail.length;
+  const hint = sandboxOutputHint(result);
+  const marker = `[... truncated ${omitted} characters${
+    extraNote ? `; ${extraNote}` : ""
+  }${hint ? `. ${hint}` : ""} ...]`;
+  return `${head}\n${marker}\n${tail}`;
+}
+
+// A bare "[truncated]" says the output was cut but not that the rest is still
+// reachable, and carrying full_output_path as a bare key proved too weak a
+// cue on its own: measured, the model read the key, ignored it, and answered
+// NOT-VISIBLE while the complete output sat in the sandbox. Spelling out the
+// recovery at the point of the cut is what actually gets used.
+//
+// Shared with the pi-core adapter, which mirrors this truncation on its own
+// path and pointed the model at a host-side artifact it has no way to open.
+export function sandboxOutputHint(result: unknown): string {
+  if (typeof result !== "object" || result === null || Array.isArray(result)) {
+    return "";
+  }
+  const record = result as Record<string, unknown>;
+  if (typeof record.full_output_path !== "string") {
+    return "";
+  }
+  const chars =
+    typeof record.full_output_chars === "number"
+      ? ` (${record.full_output_chars} chars)`
+      : "";
+  return `The complete output${chars} is saved inside the sandbox at ${record.full_output_path} - read, tail, or grep that file to recover what was cut off here.`;
 }
 
 function sanitizePathSegment(value: string): string {

@@ -28,7 +28,7 @@ EXO=./target/debug/exo
 # whose prompt demands a bare number at the end grades the actual answer
 # rather than anything the model said while working.
 # ---------------------------------------------------------------------------
-CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report)
+CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report t7-batchedcounter)
 
 case_tier() {
   case "$1" in
@@ -42,6 +42,14 @@ case_tier() {
     # files, more edits to existing content, more chances for a quoting or
     # stale-read mistake to compound) rather than merely asking for more steps.
     t6-*) echo "6-hard-multifile" ;;
+    # Targets a real, documented architecture difference rather than a guess:
+    # exo/harness-pi-core.ts sets toolExecution: "sequential" (Exo's tools
+    # share one sandbox filesystem); pi-agent-core's own default is
+    # "parallel" when a turn batches multiple tool calls
+    # (agent-loop.js: hasSequentialToolCall). A shared-counter race only
+    # shows up if parallel execution actually happens, so this tier only
+    # measures anything on a prompt that forces the model to batch calls.
+    t7-*) echo "7-parallel-race" ;;
   esac
 }
 
@@ -59,6 +67,7 @@ case_expect() {
     t6-refactor)  echo '(^|[^0-9])9([^0-9]|$)' ;;
     t6-twobugs)   echo '(^|[^0-9])30([^0-9]|$)' ;;
     t6-report)    echo '(^|[^0-9])3([^0-9]|$)' ;;
+    t7-batchedcounter) echo '(^|[^0-9])5([^0-9]|$)' ;;
   esac
 }
 
@@ -106,6 +115,8 @@ echo \$total
 This script is meant to sum the EVEN numbers from 1 to 10 (2+4+6+8+10), but it has two deliberate bugs: one syntax error that stops it running at all, and one logic error that makes it sum the wrong numbers. Run it, read the error, fix both bugs, and re-run until it prints the correct even-number total. Finish your reply with the number it finally prints, as a bare number on its own line." ;;
     t6-report)
       echo "In /tmp/t6c/data, create five files f1.csv through f5.csv containing exactly 2, 4, 6, 1 and 5 lines respectively (any text content, one record per line). Then write /tmp/t6c/count.sh which examines every .csv file in /tmp/t6c/data and echoes how many of them have MORE THAN 3 lines. Run count.sh. Then verify by listing the line count of each file. Finish your reply with the number count.sh printed, as a bare number on its own line." ;;
+    t7-batchedcounter)
+      echo "In /tmp/t7a, create counter.txt containing 0. Then, in ONE single reply, issue exactly 5 tool calls together (do not wait for any result before issuing the next one, and do not use separate replies) - all 5 must run this exact unmodified command: num=\$(cat /tmp/t7a/counter.txt); sleep 0.2; echo \$((num+1)) > /tmp/t7a/counter.txt . Do not run any other command and do not run any additional increments beyond those 5 - if the final count looks wrong, report it as-is rather than issuing more tool calls to correct it. In your NEXT reply after those 5 calls finish, immediately cat /tmp/t7a/counter.txt once and finish with the number it printed, on its own line, with no further tool calls." ;;
   esac
 }
 

@@ -91,6 +91,7 @@ import type { TSchema } from "typebox";
 import {
   assistantTextMessage,
   messageText,
+  buildTruncatedPreview,
   messagesEvent,
   toolRequestedEvent,
   toolResultEvent,
@@ -169,7 +170,6 @@ export function toolInstanceToAgentTool(
 // ToolResult value itself; this is a simpler single-artifact mirror that
 // still bounds the size, which is the property that matters here.
 const TOOL_RESULT_INLINE_LIMIT_CHARS = 8_000;
-const TOOL_RESULT_PREVIEW_CHARS = 4_000;
 
 async function compactToolResultForModel(
   context: TurnContext,
@@ -185,13 +185,27 @@ async function compactToolResultForModel(
     path: `tool-results/${sanitizePathSegment(toolName)}/${sanitizePathSegment(toolCallId)}/result.json`,
     text: serialized,
   });
-  const preview = serialized.slice(0, TOOL_RESULT_PREVIEW_CHARS);
-  const text = `${preview}\n...[truncated ${serialized.length - TOOL_RESULT_PREVIEW_CHARS} more characters; full result written to artifact ${artifact.artifactId} at ${artifact.path}]`;
+  // The artifact reference alone is worse than nothing here: it reads like a
+  // path the model can open, and it is host-side, so every attempt to follow
+  // it fails. buildTruncatedPreview keeps both ends of the output and adds the
+  // one location that is actually reachable from inside the sandbox.
+  const text = buildTruncatedPreview(
+    serialized,
+    result,
+    `full result written to artifact ${artifact.artifactId} at ${artifact.path}`,
+  );
   return {
     text,
     details: {
       truncated: true,
-      preview,
+      // Must be the same text the model was shown, not a second, narrower
+      // slice of its own. details is what piMessageToExoMessage replays into
+      // context on every later round, so a head-only preview here silently
+      // undid the head+tail fix one round after the tool ran: the tail was in
+      // the immediate result and gone from the transcript the model reasoned
+      // over. Measured as pi-core answering NOT-VISIBLE while the value it
+      // was asked for sat in the tool result it had just received.
+      preview: text,
       artifactId: artifact.artifactId,
       path: artifact.path,
       sizeBytes: artifact.sizeBytes,
