@@ -28,7 +28,7 @@ EXO=./target/debug/exo
 # whose prompt demands a bare number at the end grades the actual answer
 # rather than anything the model said while working.
 # ---------------------------------------------------------------------------
-CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline)
+CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report)
 
 case_tier() {
   case "$1" in
@@ -37,6 +37,11 @@ case_tier() {
     t3-*) echo "3-multi-round" ;;
     t4-*) echo "4-debug-loop" ;;
     t5-*) echo "5-long-multistep" ;;
+    # Tier 6 exists because tier 5 stopped separating the harnesses once file
+    # tools landed: several agents sat at 6/6 there. These run longer (more
+    # files, more edits to existing content, more chances for a quoting or
+    # stale-read mistake to compound) rather than merely asking for more steps.
+    t6-*) echo "6-hard-multifile" ;;
   esac
 }
 
@@ -51,6 +56,9 @@ case_expect() {
     t4-fixbug)   echo '(^|[^0-9])6([^0-9]|$)' ;;
     t5-multifile) echo '(^|[^0-9])3/3([^0-9]|$)' ;;
     t5-pipeline)  echo '(^|[^0-9])10([^0-9]|$)' ;;
+    t6-refactor)  echo '(^|[^0-9])9([^0-9]|$)' ;;
+    t6-twobugs)   echo '(^|[^0-9])30([^0-9]|$)' ;;
+    t6-report)    echo '(^|[^0-9])3([^0-9]|$)' ;;
   esac
 }
 
@@ -82,6 +90,22 @@ Then run it with bash. It contains a deliberate syntax error. Read the error out
       echo "In /tmp/proj, build a tiny bash calculator library across two files: lib.sh defining three functions add(), sub(), mul() (each takes two args and echoes the arithmetic result using \$((...))), and test.sh that sources lib.sh and runs exactly 3 checks: add 2 3 should print 5, sub 10 4 should print 6, mul 3 3 should print 9. test.sh should print PASS or FAIL per check and a final summary line in the exact form 'N/3 passed'. Run test.sh. If any check fails, find and fix the bug (it may be in lib.sh or in test.sh's expected values), then re-run test.sh until it reports 3/3 passed. Finish your reply with that exact final summary line, nothing else added after it." ;;
     t5-pipeline)
       echo "In /tmp/proj2, build a 3-stage bash pipeline as 3 separate scripts, running each one with a separate tool call in order: gen.sh writes the integers 1 through 20, one per line, to raw.txt. filter.sh reads raw.txt and writes only the even numbers, one per line, to filtered.txt. count.sh reads filtered.txt and writes the number of lines in it to result.txt. Run gen.sh, then filter.sh, then count.sh, each as its own tool call - do not combine them into one command. Then cat result.txt. Finish your reply with the number from result.txt as a bare number on its own line." ;;
+    t6-refactor)
+      echo "In /tmp/t6a, create lib.sh defining a bash function named add_all that sums all of its arguments and echoes the total, and main.sh that sources ./lib.sh and calls add_all 2 3 4, echoing the result. Run main.sh with bash and confirm it prints 9. Then rename the function from add_all to sum_all in BOTH files, so no reference to add_all remains anywhere. Run main.sh again and confirm it still works. Finish your reply with the number main.sh prints after the rename, as a bare number on its own line." ;;
+    t6-twobugs)
+      printf '%s' "Create /tmp/t6b/buggy.sh with exactly this content:
+#!/bin/bash
+total=0
+for i in 1 2 3 4 5 6 7 8 9 10; do
+  if [ \$((i % 2)) -eq 1 ]; then
+    total=\$((total + i)
+  fi
+done
+echo \$total
+
+This script is meant to sum the EVEN numbers from 1 to 10 (2+4+6+8+10), but it has two deliberate bugs: one syntax error that stops it running at all, and one logic error that makes it sum the wrong numbers. Run it, read the error, fix both bugs, and re-run until it prints the correct even-number total. Finish your reply with the number it finally prints, as a bare number on its own line." ;;
+    t6-report)
+      echo "In /tmp/t6c/data, create five files f1.csv through f5.csv containing exactly 2, 4, 6, 1 and 5 lines respectively (any text content, one record per line). Then write /tmp/t6c/count.sh which examines every .csv file in /tmp/t6c/data and echoes how many of them have MORE THAN 3 lines. Run count.sh. Then verify by listing the line count of each file. Finish your reply with the number count.sh printed, as a bare number on its own line." ;;
   esac
 }
 
