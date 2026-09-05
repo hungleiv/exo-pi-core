@@ -317,7 +317,17 @@ const DEFAULT_ENABLED_NETWORK_NAME: &str = "exo-default";
 const WARM_SANDBOX_KEEPALIVE_ARGV: &[&str] = &["sleep", "infinity"];
 const WARM_SANDBOX_HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(3);
 const WARM_SANDBOX_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-const ORPHANED_WARM_SANDBOX_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+// The real safety gate is owner_pid_is_alive: once that's false, the process
+// that created this container is provably gone and is not coming back for
+// it, so there's little left for an age buffer to protect against beyond a
+// narrow window right at container creation. A 24-hour buffer meant that a
+// benchmark run creating one-shot, conversation-scoped sandboxes (never
+// reused - see harness-bench.sh, which gives every case its own conversation)
+// left them running for a full day regardless of how quickly their owning
+// `exo` process exited. Observed directly: 354 of 357 containers on one
+// dev host were owned by dead PIDs, most only hours old, consuming enough
+// memory between them to get a background benchmark run OOM-killed.
+const ORPHANED_WARM_SANDBOX_MIN_AGE: Duration = Duration::from_secs(15 * 60);
 const DEFAULT_NETWORK_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_NETWORK_CREATE_RETRY_DELAY: Duration = Duration::from_millis(200);
 pub(crate) const WARM_SANDBOX_KEY_LABEL: &str = "exo.sandbox.key";
@@ -2279,6 +2289,31 @@ async fn docker_load_image(container_bin: &Path, payload: &Bytes) -> Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // This is the real safety gate for reap_orphaned_warm_sandboxes: once it
+    // says false, ORPHANED_WARM_SANDBOX_MIN_AGE is the only thing left
+    // between a running container and cleanup_named_container, so it needs
+    // to be right in both directions rather than just "probably fine."
+    #[test]
+    fn owner_pid_is_alive_reports_the_current_process_as_alive() {
+        let pid = std::process::id().to_string();
+        assert!(owner_pid_is_alive(&pid));
+    }
+
+    #[test]
+    fn owner_pid_is_alive_reports_a_pid_no_process_holds_as_dead() {
+        // PIDs this large exceed pid_max on every platform this runs on, so
+        // no live process can ever hold this number - unlike a small pid
+        // that merely isn't running *right now*, which could flake if the
+        // OS happens to reuse it during the test.
+        assert!(!owner_pid_is_alive("4000000000"));
+    }
+
+    #[test]
+    fn owner_pid_is_alive_rejects_non_numeric_input() {
+        assert!(!owner_pid_is_alive("not-a-pid"));
+        assert!(!owner_pid_is_alive(""));
+    }
 
     #[test]
     fn conversation_sandbox_key_uses_thread_id_and_reads_conversation_id() {
