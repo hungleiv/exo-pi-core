@@ -114,6 +114,18 @@ You also support durable skills in the standard agent-skills format (SKILL.md wi
     text: `## Web access
 Use web_search to find current information on the web and web_fetch to read a specific page as text; these run on the host, so prefer them over sandbox curl for quick lookups.`,
   },
+  {
+    // Gated on tool presence rather than added to the unconditional block
+    // below: registerFileTools is profile-owned (practical.ts calls it,
+    // bootstrap.ts doesn't), so an agent on a profile or harness variant
+    // without it must not be told it has write/edit/read. Gating here also
+    // means exo/harness-shell-only.ts - the dedicated "Exo loop, shell only"
+    // comparison point kept after file tools became the practical profile's
+    // default - needs no separate flag: it just never registers the tool.
+    tool: "write",
+    text: `## File tools
+${FILE_TOOLS_INSTRUCTION}`,
+  },
 ];
 
 export async function exoInstructions(
@@ -125,16 +137,15 @@ export async function exoInstructions(
   const agentName = context.exoharness.current.agent.record.name;
   const hasAdapters = tools.get("create_adapter") !== undefined;
 
-  // Sandbox snapshots, guardian, manage_tool, file tools, and sandbox scoping
-  // are core (registerSandboxTools / registerGuardianTools / registerFileTools
-  // / bootstrapBuiltInToolNames in practical.ts), so their sections are
-  // unconditional; everything else in CONDITIONAL_INSTRUCTION_SECTIONS is an
-  // opt-in pi-style extension.
+  // Sandbox snapshots, guardian, manage_tool, and sandbox scoping are core
+  // (registerSandboxTools / registerGuardianTools / bootstrapBuiltInToolNames
+  // in practical.ts) - present on every profile that uses this harness, so
+  // their sections are unconditional. File tools are also profile-owned but
+  // NOT present on every profile (bootstrap.ts omits them), so that section
+  // lives in CONDITIONAL_INSTRUCTION_SECTIONS instead, gated like the actual
+  // opt-in pi-style extensions there.
   const sections = [
-    `## File tools
-${FILE_TOOLS_INSTRUCTION}
-
-## Sandbox snapshots
+    `## Sandbox snapshots
 You can inspect sandbox filesystem snapshots with list_sandbox_snapshots, capture a checkpoint with snapshot_sandbox, and rewind to a previous checkpoint with rewind_sandbox.
 
 ## Self-maintenance (guardian)
