@@ -763,7 +763,7 @@ function contentText(content: unknown): string {
         "tool_name" in part &&
         "arguments" in part
       ) {
-        return `[tool_call ${String((part as { tool_name?: unknown }).tool_name)}] ${stringifyValue((part as { arguments?: unknown }).arguments)}`;
+        return `[tool_call ${String((part as { tool_name?: unknown }).tool_name)}] ${stringifyValue(unwrapToolArguments((part as { arguments?: unknown }).arguments))}`;
       }
       return "";
     })
@@ -868,6 +868,42 @@ function isToolResultEvent(data: EventData): data is EventData & {
   result: ToolResult;
 } {
   return data.type === "tool_result" && typeof data.tool_call_id === "string";
+}
+
+// lingua stores tool-call arguments behind a validation tag
+// ({type: "valid", value: <the arguments the model actually sent>}). That tag
+// is storage detail; the model never sent it and must never see it.
+//
+// Rendering it verbatim into replayed history caused a real runaway: a model
+// read `[tool_call shell] {"type":"valid","value":{"command":"..."}}` off its
+// own transcript, copied that shape into its next call, and got back "missing
+// field `command`" from a tool that wanted {"command": ...}. The failed call
+// was replayed too, so every round showed the model more evidence that the
+// wrapper was the right format. Arguments grew 31 bytes -> 101 -> 30KB over 236
+// rounds until they blew the output-token limit and started arriving truncated
+// ("Unterminated string in JSON"), which is where ~$9 of credit went.
+export function unwrapToolArguments(value: unknown): unknown {
+  let current = value;
+  // Bounded rather than `while (true)`: the transcript that motivated this had
+  // already reached two levels, and a malformed one could nest further.
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (!isRecord(current)) {
+      return current;
+    }
+    const keys = Object.keys(current);
+    if (
+      keys.length !== 2 ||
+      !keys.includes("type") ||
+      !keys.includes("value")
+    ) {
+      return current;
+    }
+    if (current.type !== "valid" && current.type !== "invalid") {
+      return current;
+    }
+    current = current.value;
+  }
+  return current;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

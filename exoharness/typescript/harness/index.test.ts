@@ -19,6 +19,7 @@ import {
   toolResultMessage,
   toolResultEvent,
   toolResultEventIsError,
+  unwrapToolArguments,
   type Event,
   type EventData,
   type JsonObject,
@@ -230,6 +231,40 @@ describe("HarnessToolRegistry", () => {
         value: null,
       }),
     ]);
+  });
+});
+
+describe("unwrapToolArguments", () => {
+  it("strips a single validation wrapper", () => {
+    expect(
+      unwrapToolArguments({ type: "valid", value: { command: "ls" } }),
+    ).toEqual({ command: "ls" });
+  });
+
+  // The shape that actually appeared in the runaway transcript: the model had
+  // started copying the wrapper it saw, so history held two levels of it.
+  it("strips nested validation wrappers", () => {
+    expect(
+      unwrapToolArguments({
+        type: "valid",
+        value: { type: "valid", value: { command: "ls" } },
+      }),
+    ).toEqual({ command: "ls" });
+  });
+
+  it("leaves plain arguments untouched", () => {
+    expect(unwrapToolArguments({ command: "ls" })).toEqual({ command: "ls" });
+  });
+
+  // A tool whose own arguments legitimately are {type, value} must survive:
+  // only the validation tags "valid"/"invalid" mean a wrapper.
+  it("does not strip a payload that merely has type and value keys", () => {
+    const args = { type: "checkbox", value: "on" };
+    expect(unwrapToolArguments(args)).toEqual(args);
+  });
+
+  it("returns non-object arguments as they are", () => {
+    expect(unwrapToolArguments("raw")).toBe("raw");
   });
 });
 
