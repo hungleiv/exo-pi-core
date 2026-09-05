@@ -19,9 +19,11 @@
 // deterministically, by base64-encoding on the way in and decoding inside the
 // sandbox. There is no quoting decision left for the model to get wrong.
 //
-// These are registered only by the pi-core harness path
-// (exo/harness-pi-core-files.ts), never by registerBuiltInTools, so the
-// exo-bench and pi-bench baselines stay exactly as they are.
+// Registered by the pi-core harness (exo/harness-pi-core.ts, default as of
+// its file-tools benchmark results) and its explicit -files alias, never by
+// registerBuiltInTools - the default "exo" harness (exo/harness.ts) and the
+// real-Pi-CLI wrapper (examples/typescript/pi-harness.ts) are untouched, so
+// those baselines stay exactly as they are for comparison.
 
 import type {
   HarnessToolRegistry,
@@ -51,7 +53,7 @@ export function registerFileTools(tools: HarnessToolRegistry): void {
   tools.register(readToolInstance());
 }
 
-function writeToolInstance(): ToolInstance {
+export function writeToolInstance(): ToolInstance {
   return {
     source: "built_in",
     definition: {
@@ -76,6 +78,7 @@ function writeToolInstance(): ToolInstance {
     },
     handler: {
       async execute(args, execution): Promise<ToolResult> {
+        rejectUnknownArguments(args, ["path", "content"]);
         const path = requireString(args, "path");
         const content = requireString(args, "content");
         await writeFile(execution, path, content);
@@ -88,7 +91,7 @@ function writeToolInstance(): ToolInstance {
   };
 }
 
-function editToolInstance(): ToolInstance {
+export function editToolInstance(): ToolInstance {
   return {
     source: "built_in",
     definition: {
@@ -129,6 +132,7 @@ function editToolInstance(): ToolInstance {
     },
     handler: {
       async execute(args, execution): Promise<ToolResult> {
+        rejectUnknownArguments(args, ["path", "edits"]);
         const path = requireString(args, "path");
         const edits = parseEdits(args.edits);
         let content = await readFile(execution, path);
@@ -151,7 +155,7 @@ function editToolInstance(): ToolInstance {
   };
 }
 
-function readToolInstance(): ToolInstance {
+export function readToolInstance(): ToolInstance {
   return {
     source: "built_in",
     definition: {
@@ -172,6 +176,7 @@ function readToolInstance(): ToolInstance {
     },
     handler: {
       async execute(args, execution): Promise<ToolResult> {
+        rejectUnknownArguments(args, ["path"]);
         const path = requireString(args, "path");
         const content = await readFile(execution, path);
         const truncated = truncate(content);
@@ -296,6 +301,20 @@ function shellQuote(value: string): string {
 interface FileEdit {
   oldText: string;
   newText: string;
+}
+
+// Mirrors built-in-tools.ts's rejectUnknownArguments: the JSON schema already
+// declares additionalProperties: false, but that only constrains a model that
+// generates arguments against the schema in the first place. The incident
+// that motivated this file's other hardening (see readFile's pipefail
+// comment, and the history-replay fix in harness/index.ts) was exactly a
+// case of a malformed argument shape reaching a tool anyway - this is the
+// same defense-in-depth built-in tools already have, applied here too.
+function rejectUnknownArguments(args: JsonObject, allowed: string[]): void {
+  const unknown = Object.keys(args).find((key) => !allowed.includes(key));
+  if (unknown) {
+    throw new Error(`tool argument ${unknown} is not allowed`);
+  }
 }
 
 function requireString(args: JsonObject, key: string): string {
