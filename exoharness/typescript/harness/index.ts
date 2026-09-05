@@ -404,6 +404,58 @@ export function turnMetadata(
   };
 }
 
+// A model call that ran (real latency, real - if unrecorded - cost) but
+// produced no tool call and no real text: either a truly empty completion,
+// or the model described a tool call in prose instead of invoking it
+// (MALFORMED_TOOL_CALL_TEXT_PATTERN). Ported from
+// exo/tools/pi-agent-adapters.ts's identically-named function, which
+// exo/harness-pi-core.ts uses to nudge a retry - turn-loop.ts (the default
+// "exo" harness, used by every production agent including exo-agent) had no
+// equivalent, so a hard tier-6 task could end a turn this way with nothing
+// in the event log to say why. Deliberately restricted to "text"-typed
+// parts, like the pi-core version: a reasoning-only response is a distinct,
+// not-yet-observed failure shape and lumping it in here would be guessing
+// past what's actually been seen.
+const MALFORMED_TOOL_CALL_TEXT_PATTERN = /tool[_ ]call/i;
+
+export function looksLikeUnfinishedTurn(message: Message): boolean {
+  if (message.role !== "assistant") {
+    return false;
+  }
+  const content = message.content;
+  if (typeof content === "string") {
+    return (
+      content.trim().length === 0 ||
+      MALFORMED_TOOL_CALL_TEXT_PATTERN.test(content)
+    );
+  }
+  if (!Array.isArray(content)) {
+    return false;
+  }
+  const hasToolCall = content.some(
+    (part) =>
+      part &&
+      typeof part === "object" &&
+      (part as { type?: unknown }).type === "tool_call",
+  );
+  if (hasToolCall) {
+    return false;
+  }
+  const text = content
+    .filter(
+      (part): part is { type: "text"; text: string } =>
+        Boolean(part) &&
+        typeof part === "object" &&
+        (part as { type?: unknown }).type === "text" &&
+        typeof (part as { text?: unknown }).text === "string",
+    )
+    .map((part) => part.text)
+    .join("");
+  return (
+    text.trim().length === 0 || MALFORMED_TOOL_CALL_TEXT_PATTERN.test(text)
+  );
+}
+
 export function assertRoundBudget(
   context: TurnContext,
   round: number,

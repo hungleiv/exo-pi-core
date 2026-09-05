@@ -18,6 +18,7 @@ import {
   materializeEventsToMessages,
   toolResultMessage,
   toolResultEvent,
+  looksLikeUnfinishedTurn,
   toolResultEventIsError,
   unwrapToolArguments,
   type Event,
@@ -231,6 +232,55 @@ describe("HarnessToolRegistry", () => {
         value: null,
       }),
     ]);
+  });
+});
+
+describe("looksLikeUnfinishedTurn", () => {
+  it("is false for a message with a real tool call", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: [{ type: "tool_call", tool_name: "shell", arguments: {} }],
+      }),
+    ).toBe(false);
+  });
+
+  it("is false for a message with real text", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: "391",
+      }),
+    ).toBe(false);
+  });
+
+  it("is true for an empty string content", () => {
+    expect(looksLikeUnfinishedTurn({ role: "assistant", content: "" })).toBe(
+      true,
+    );
+  });
+
+  it("is true for an empty array content", () => {
+    expect(looksLikeUnfinishedTurn({ role: "assistant", content: [] })).toBe(
+      true,
+    );
+  });
+
+  // The other real failure shape this exists for: the model describes a tool
+  // call in prose instead of actually invoking it.
+  it("is true for text that describes a tool call instead of making one", () => {
+    expect(
+      looksLikeUnfinishedTurn({
+        role: "assistant",
+        content: [
+          { type: "text", text: "I will now make a tool call to shell." },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("is false for a non-assistant message", () => {
+    expect(looksLikeUnfinishedTurn({ role: "user", content: "" })).toBe(false);
   });
 });
 

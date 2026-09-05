@@ -1,6 +1,8 @@
 import {
   createToolRegistry,
+  looksLikeUnfinishedTurn,
   materializePromptMessages,
+  messagesEvent,
   MAX_CONSECUTIVE_TOOL_ERRORS,
   registerBuiltInTools,
   registerInstalledTools,
@@ -8,6 +10,7 @@ import {
   registerLibraryToolModulePath,
   toolResultEventIsError,
   turnMetadata,
+  userTextMessage,
   type BuiltInToolName,
   type EventData,
   type HarnessToolRegistry,
@@ -15,6 +18,7 @@ import {
   type TurnContext,
 } from "@exo/harness";
 import {
+  responseMessages,
   responseToLinguaEvents,
   responseToolCalls,
   runtimeFromModelBinding,
@@ -25,6 +29,18 @@ import {
 import { ensureTable } from "@exo/model-runtime/cost";
 
 import { resolveLlmBinding } from "./shared";
+
+// Cap on how many times a single turn will nudge the model to retry an
+// unfinished turn (empty response, or a tool call described as plain text)
+// before giving up and letting the turn end anyway. Ported from
+// exo/harness-pi-core.ts's identical constant/mechanism - ~$0 without one,
+// a hard tier-6 benchmark task showed gpt-5-nano producing this exact
+// failure shape on exo/harness.ts (the harness every production "exo" agent
+// uses) with no recovery and nothing in the event log explaining why the
+// turn ended empty.
+const MAX_UNFINISHED_TURN_NUDGES = 5;
+const UNFINISHED_TURN_NUDGE_TEXT =
+  "Your previous reply didn't finish the task - it was either empty or described a tool call as plain text instead of actually invoking it. Continue the task: call the tool using the actual function-calling mechanism, or give a real final answer if the work is genuinely done.";
 
 export interface ResponsesTurnLoopOptions {
   instructions?: (
@@ -114,6 +130,7 @@ async function runResponsesTurnLoop(
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
   let latestEventId: string | null = null;
   let consecutiveToolErrors = 0;
+  let unfinishedTurnNudges = 0;
 
   for (let round = 0; ; round += 1) {
     if (
@@ -187,6 +204,36 @@ async function runResponsesTurnLoop(
     );
     if (toolCalls.length === 0) {
       if (hasSyntheticToolResult) {
+        continue;
+      }
+      // A model call that produces no assistant message at all (gpt-5-nano
+      // returning a bare reasoning item with no message/output_text - the
+      // shape actually observed live) is the same failure as an assistant
+      // message with empty content, not a reason to skip the nudge: without
+      // this, `lastMessage` is undefined and the check below never fires.
+      const lastMessage = responseMessages(response).at(-1);
+      const unfinished = !lastMessage || looksLikeUnfinishedTurn(lastMessage);
+      if (unfinished && unfinishedTurnNudges < MAX_UNFINISHED_TURN_NUDGES) {
+        unfinishedTurnNudges += 1;
+        // Instrumentation, not behaviour: lets a benchmark or operator count
+        // how often this recovery path actually fires (jq over
+        // artifact_written events whose path starts with "turn-loop/nudge-").
+        // Failing to record must never cost a turn, hence the swallowed error.
+        try {
+          await context.exoharness.current.turn.writeArtifactText({
+            path: `turn-loop/nudge-${unfinishedTurnNudges}.json`,
+            text: JSON.stringify({
+              nudge: unfinishedTurnNudges,
+              reason: "unfinished-turn",
+              at: new Date().toISOString(),
+            }),
+          });
+        } catch {
+          // Instrumentation is best-effort.
+        }
+        latestEventId = await appendTurnEvents(context, [
+          messagesEvent([userTextMessage(UNFINISHED_TURN_NUDGE_TEXT)]),
+        ]);
         continue;
       }
       return latestEventId;

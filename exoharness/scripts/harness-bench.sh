@@ -155,7 +155,7 @@ collect() {
       prompt_tokens: ([.events[] | select(.data.type=="messages") | .data.usage.prompt_tokens? // 0] | add // 0),
       completion_tokens: ([.events[] | select(.data.type=="messages") | .data.usage.completion_tokens? // 0] | add // 0),
       nudges: ([.events[] | select(.data.type=="artifact_written")
-                | select((.data.path? // "") | startswith("pi-core/nudge-"))] | length)
+                | select((.data.path? // "") | startswith("pi-core/nudge-") or startswith("turn-loop/nudge-"))] | length)
     }'
 }
 
