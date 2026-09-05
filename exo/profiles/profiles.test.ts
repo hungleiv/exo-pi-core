@@ -46,6 +46,7 @@ describe("Exo profiles", () => {
     // built_in); the optional toolsets load as pi extensions
     // (EXO_PI_EXTENSIONS_BUNDLED in real runs, unset here).
     expect(tools.get("snapshot_sandbox")?.source).toBe("built_in");
+    expect(tools.get("write")?.source).toBe("built_in");
     expect(tools.get("rebuild_and_restart_exo")?.source).toBe("built_in");
     expect(tools.get("web_search")).toBeUndefined();
     expect(tools.get("create_adapter")).toBeUndefined();
@@ -63,6 +64,9 @@ describe("Exo profiles", () => {
       "list_sandbox_snapshots",
       "snapshot_sandbox",
       "rewind_sandbox",
+      "write",
+      "edit",
+      "read",
       "rebuild_and_restart_exo",
     ]);
   });

@@ -10,6 +10,7 @@ import {
   type TurnContext,
 } from "@exo/harness";
 
+import { FILE_TOOLS_INSTRUCTION } from "./tools/file-tools";
 import { memoryInstruction } from "./tools/memory-tools";
 import { resolveExoProfile } from "./profiles";
 import { todoInstruction } from "./tools/todo-tools";
@@ -124,12 +125,16 @@ export async function exoInstructions(
   const agentName = context.exoharness.current.agent.record.name;
   const hasAdapters = tools.get("create_adapter") !== undefined;
 
-  // Sandbox snapshots, guardian, manage_tool, and sandbox scoping are core
-  // (registerSandboxTools / registerGuardianTools / bootstrapBuiltInToolNames
-  // in practical.ts), so their sections are unconditional; everything else
-  // in CONDITIONAL_INSTRUCTION_SECTIONS is an opt-in pi-style extension.
+  // Sandbox snapshots, guardian, manage_tool, file tools, and sandbox scoping
+  // are core (registerSandboxTools / registerGuardianTools / registerFileTools
+  // / bootstrapBuiltInToolNames in practical.ts), so their sections are
+  // unconditional; everything else in CONDITIONAL_INSTRUCTION_SECTIONS is an
+  // opt-in pi-style extension.
   const sections = [
-    `## Sandbox snapshots
+    `## File tools
+${FILE_TOOLS_INSTRUCTION}
+
+## Sandbox snapshots
 You can inspect sandbox filesystem snapshots with list_sandbox_snapshots, capture a checkpoint with snapshot_sandbox, and rewind to a previous checkpoint with rewind_sandbox.
 
 ## Self-maintenance (guardian)
