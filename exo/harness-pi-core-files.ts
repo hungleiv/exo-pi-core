@@ -25,6 +25,6 @@ import { runPiCoreTurn } from "./harness-pi-core";
 
 export default defineHarness({
   async runTurn(context) {
-    await runPiCoreTurn(context, { fileTools: true });
+    await runPiCoreTurn(context);
   },
 });

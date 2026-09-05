@@ -41,13 +41,13 @@ import {
   defineHarness,
   MAX_CONSECUTIVE_TOOL_ERRORS,
   materializePromptMessages,
+  type HarnessToolRegistry,
   type TurnContext,
 } from "@exo/harness";
 import { runtimeFromModelBinding } from "@exo/model-runtime/responses";
 import { appendEvents, resolveLlmBinding } from "@exo/model-runtime/shared";
 
 import { exoInstructions, registerExoTools } from "./harness";
-import { FILE_TOOLS_INSTRUCTION, registerFileTools } from "./tools/file-tools";
 import {
   buildModelStub,
   createExoStreamFn,
@@ -70,17 +70,26 @@ const MAX_UNFINISHED_TURN_NUDGES = 5;
 
 export default defineHarness({
   async runTurn(context) {
-    await runPiCoreTurn(context, { fileTools: true });
+    await runPiCoreTurn(context);
   },
 });
 
 export interface PiCoreTurnOptions {
-  // Register the write/edit/read tools from exo/tools/file-tools.ts on top of
-  // Exo's shell-only built-ins. Off by default so this harness stays a pure
-  // "same tools, different loop" comparison against exo/harness.ts; the
-  // variant that turns it on lives in harness-pi-core-files.ts, which keeps
-  // the two variables (loop, tool surface) separable in benchmarks.
-  fileTools?: boolean;
+  // Defaults to registerExoTools, which - since file tools were promoted to
+  // the practical profile's real tool set (see git history) - already
+  // includes write/edit/read. This used to be a `fileTools?: boolean` flag
+  // that called registerFileTools a second time on top of registerExoTools;
+  // once registerExoTools started including it too, that became a literal
+  // double registration ("tool is already registered: write"), reproduced
+  // live: every pi-core-files-ds benchmark call failed instantly, 0 rounds,
+  // no error event, because the harness process crashed before ever
+  // materializing a prompt. Pass a custom registerTools (see
+  // harness-pi-core-shell-only.ts) to get a tool surface other than the
+  // real default - not a flag layered on top of it.
+  registerTools?: (
+    tools: HarnessToolRegistry,
+    context: TurnContext,
+  ) => Promise<void> | void;
 }
 
 export async function runPiCoreTurn(
@@ -88,18 +97,9 @@ export async function runPiCoreTurn(
   options: PiCoreTurnOptions = {},
 ): Promise<void> {
   const tools = createToolRegistry(context);
-  await registerExoTools(tools, context);
-  if (options.fileTools) {
-    registerFileTools(tools);
-  }
+  await (options.registerTools ?? registerExoTools)(tools, context);
 
   const instructions = await exoInstructions(context, tools);
-  if (options.fileTools) {
-    instructions.push({
-      role: "developer",
-      content: FILE_TOOLS_INSTRUCTION,
-    });
-  }
   const materialized = await materializePromptMessages(
     context.exoharness.current.conversation,
     instructions,
