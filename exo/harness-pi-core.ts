@@ -5,6 +5,17 @@
 // @earendil-works/pi-agent-core Agent instead of Exo's own hand-written
 // runResponsesTurnLoop (exoharness/typescript/model-runtime/turn-loop.ts).
 //
+// Defaults to file tools on (write/edit/read - see tools/file-tools.ts) as of
+// the benchmarking below; the shell-only variant that used to live here is
+// preserved as harness-pi-core-shell-only.ts for comparison, not deleted.
+// Across every model benchmarked, file tools matched or beat shell-only, most
+// dramatically on weaker/faster models that struggle with shell quoting:
+//   gpt-5-nano:            27/27 vs 26/27
+//   Gemini 2.5 Flash Lite: 23/27 vs 14/27
+// No case favored shell-only. This module's own history is the reason: a
+// runaway tool-call loop that cost ~$9 of credit traced back to a shell
+// heredoc quoting collapse (see git log for the incident and its fixes).
+//
 // This does NOT replace the default harness or the "practical" profile -
 // point --harness at this module's path to try it instead:
 //   ./target/debug/exo agent create "Pi-core test" --harness exo/harness-pi-core.ts --model ...
@@ -59,7 +70,7 @@ const MAX_UNFINISHED_TURN_NUDGES = 5;
 
 export default defineHarness({
   async runTurn(context) {
-    await runPiCoreTurn(context);
+    await runPiCoreTurn(context, { fileTools: true });
   },
 });
 
