@@ -419,6 +419,26 @@ export function assertRoundBudget(
   }
 }
 
+// A round-count cap can't tell a task that legitimately needs many tool
+// calls apart from one stuck resending the same failing call - both just
+// look like "many rounds". A model that got confused by a malformed
+// shell-tool argument once did exactly that: 230 consecutive identical
+// failures over 2.5 hours before anyone noticed the cost draining, right
+// through a much higher round cap. Failing the same way over and over is
+// the actual signal to catch, independent of any round budget.
+export const MAX_CONSECUTIVE_TOOL_ERRORS = 5;
+
+// `ToolResult` is untyped JSON, but every tool call that goes through
+// `ToolRegistry.executePending` (harness/tools.ts) normalizes a thrown
+// error to `{ok: false, error: ...}` - this checks that same convention.
+export function toolResultEventIsError(data: EventData): boolean {
+  if (data.type !== "tool_result") {
+    return false;
+  }
+  const result = (data as { result?: unknown }).result;
+  return isRecord(result) && result.ok === false;
+}
+
 export function systemTextMessage(text: string): Message {
   return {
     role: "system",

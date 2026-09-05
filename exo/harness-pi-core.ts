@@ -28,6 +28,7 @@ import { Agent } from "@earendil-works/pi-agent-core";
 import {
   createToolRegistry,
   defineHarness,
+  MAX_CONSECUTIVE_TOOL_ERRORS,
   materializePromptMessages,
   type TurnContext,
 } from "@exo/harness";
@@ -133,6 +134,16 @@ export async function runPiCoreTurn(
   //     a model asked for more than one tool call in a single message.
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
   let completedRounds = 0;
+  // A round-count cap alone can't tell a task that legitimately needs many
+  // tool calls apart from one stuck resending the same failing call - both
+  // just look like "many rounds". The real-world case that motivated this:
+  // Qwen3 Coder Flash sent a malformed shell-tool argument, got a
+  // validation error, and resent the exact same call unchanged for 230
+  // consecutive rounds over 2.5 hours before anyone noticed. Tracking a
+  // consecutive-failure streak catches that in a handful of rounds
+  // regardless of what maxToolRoundTrips is set to, without penalizing a
+  // turn that is making real (even if slow) progress.
+  let consecutiveToolErrors = 0;
 
   const agent = new Agent({
     initialState: {
@@ -147,8 +158,31 @@ export async function runPiCoreTurn(
     }),
     beforeToolCall: createProtectedPathBeforeToolCallHook(),
     toolExecution: "sequential",
-    shouldStopAfterTurn: () => {
+    shouldStopAfterTurn: async (turnContext) => {
       completedRounds += 1;
+      if (
+        turnContext.toolResults.length > 0 &&
+        turnContext.toolResults.every((result) => result.isError)
+      ) {
+        consecutiveToolErrors += 1;
+      } else {
+        consecutiveToolErrors = 0;
+      }
+      if (consecutiveToolErrors >= MAX_CONSECUTIVE_TOOL_ERRORS) {
+        try {
+          await context.exoharness.current.turn.writeArtifactText({
+            path: "pi-core/aborted-consecutive-tool-errors.json",
+            text: JSON.stringify({
+              consecutiveToolErrors,
+              completedRounds,
+              at: new Date().toISOString(),
+            }),
+          });
+        } catch {
+          // Instrumentation is best-effort; the abort itself must not depend on it.
+        }
+        return true;
+      }
       return (
         maxToolRoundTrips !== null &&
         maxToolRoundTrips !== undefined &&

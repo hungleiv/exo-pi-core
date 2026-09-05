@@ -18,6 +18,7 @@ import {
   materializeEventsToMessages,
   toolResultMessage,
   toolResultEvent,
+  toolResultEventIsError,
   type Event,
   type EventData,
   type JsonObject,
@@ -229,6 +230,28 @@ describe("HarnessToolRegistry", () => {
         value: null,
       }),
     ]);
+  });
+});
+
+describe("toolResultEventIsError", () => {
+  it("is true for a tool_result event whose result has ok: false", () => {
+    const event = toolResultEvent("call-1", { ok: false, error: "boom" });
+    expect(toolResultEventIsError(event)).toBe(true);
+  });
+
+  it("is false for a tool_result event whose result has ok: true", () => {
+    const event = toolResultEvent("call-1", { ok: true, stdout: "" });
+    expect(toolResultEventIsError(event)).toBe(false);
+  });
+
+  it("is false for a tool_result event with no ok field", () => {
+    const event = toolResultEvent("call-1", { content: "no ok field here" });
+    expect(toolResultEventIsError(event)).toBe(false);
+  });
+
+  it("is false for a non tool_result event", () => {
+    const event: EventData = { type: "turn_started" };
+    expect(toolResultEventIsError(event)).toBe(false);
   });
 });
 

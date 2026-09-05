@@ -1,10 +1,12 @@
 import {
   createToolRegistry,
   materializePromptMessages,
+  MAX_CONSECUTIVE_TOOL_ERRORS,
   registerBuiltInTools,
   registerInstalledTools,
   registerLegacyAgentToolsFromDirectoryIfExists,
   registerLibraryToolModulePath,
+  toolResultEventIsError,
   turnMetadata,
   type BuiltInToolName,
   type EventData,
@@ -111,6 +113,7 @@ async function runResponsesTurnLoop(
   const { conversation } = context.exoharness.current;
   const maxToolRoundTrips = context.agentConfig.maxToolRoundTrips;
   let latestEventId: string | null = null;
+  let consecutiveToolErrors = 0;
 
   for (let round = 0; ; round += 1) {
     if (
@@ -118,6 +121,21 @@ async function runResponsesTurnLoop(
       maxToolRoundTrips !== undefined &&
       round > maxToolRoundTrips
     ) {
+      return latestEventId;
+    }
+    if (consecutiveToolErrors >= MAX_CONSECUTIVE_TOOL_ERRORS) {
+      try {
+        await context.exoharness.current.turn.writeArtifactText({
+          path: "turn-loop/aborted-consecutive-tool-errors.json",
+          text: JSON.stringify({
+            consecutiveToolErrors,
+            round,
+            at: new Date().toISOString(),
+          }),
+        });
+      } catch {
+        // Instrumentation is best-effort; the abort itself must not depend on it.
+      }
       return latestEventId;
     }
 
@@ -184,6 +202,11 @@ async function runResponsesTurnLoop(
       );
       if (toolResultEvents.length > 0) {
         latestEventId = await appendTurnEvents(context, toolResultEvents);
+      }
+      if (toolResultEvents.some(toolResultEventIsError)) {
+        consecutiveToolErrors += 1;
+      } else if (toolResultEvents.length > 0) {
+        consecutiveToolErrors = 0;
       }
     }
   }
