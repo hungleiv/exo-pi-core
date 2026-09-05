@@ -66,6 +66,14 @@ use tui::run_chat_repl;
 
 const SANDBOX_CLI_AGENT_SLUG: &str = "__exo_sandbox_cli";
 
+// Without a cap, a model stuck retrying a tool call runs forever: one such
+// case (Qwen3 Coder Flash confused by a strict single-step-per-call task)
+// ran 236 rounds over 2.5 hours and re-sent its growing history each round,
+// burning tens of millions of tokens before anyone noticed. New agents get
+// this cap unless `--max-tool-round-trips` says otherwise; existing agents
+// are unaffected until explicitly updated.
+const DEFAULT_MAX_TOOL_ROUND_TRIPS: u32 = 25;
+
 #[derive(Debug, Parser)]
 #[command(name = "exo")]
 #[command(about = "CLI for exo agents")]
@@ -1316,7 +1324,7 @@ async fn main() -> Result<()> {
                                 .is_some_and(HarnessSelection::default_enable_networking),
                             model,
                             max_output_tokens: None,
-                            max_tool_round_trips: None,
+                            max_tool_round_trips: Some(DEFAULT_MAX_TOOL_ROUND_TRIPS),
                             braintrust: None,
                         })
                         .await?
@@ -1419,7 +1427,8 @@ async fn main() -> Result<()> {
                         enable_networking,
                         model,
                         max_output_tokens,
-                        max_tool_round_trips,
+                        max_tool_round_trips: max_tool_round_trips
+                            .or(Some(DEFAULT_MAX_TOOL_ROUND_TRIPS)),
                         braintrust: build_braintrust_tracing_config(
                             braintrust_org,
                             braintrust_project,
