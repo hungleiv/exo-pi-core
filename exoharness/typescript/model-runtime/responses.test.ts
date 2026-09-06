@@ -4,6 +4,8 @@ import type { Response } from "openai/resources/responses/responses";
 import {
   AnthropicRuntime,
   ChatCompletionsRuntime,
+  linguaMessagesToResponsesInput,
+  messagesToChatMessages,
   isAnthropicModel,
   isOpenRouterBinding,
   modelRequiresResponsesApi,
@@ -148,5 +150,47 @@ describe("response tool-call parsing", () => {
         error: expect.stringContaining("Invalid JSON arguments for shell"),
       },
     });
+  });
+});
+
+describe("tool-call argument replay", () => {
+  // lingua stores arguments behind a {type:"valid",value} validation tag. The
+  // model never sent that tag and must never see it: shown its own past call
+  // in that shape, a model copies the wrapper, gets "missing field", sees the
+  // failure replayed, and nests deeper - the runaway that burned ~$9 over 236
+  // rounds. The Responses path is clean because lingua unwraps its own tag;
+  // the chat-completions path (OpenRouter, where that runaway happened) is
+  // hand-rolled here and has to unwrap explicitly.
+  const wrapped = [
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "tool_call",
+          tool_call_id: "call_1",
+          tool_name: "shell",
+          arguments: { type: "valid", value: { command: "echo hi" } },
+        },
+      ],
+    },
+  ] as never;
+
+  it("strips the validation wrapper on the chat-completions path", () => {
+    const [message] = messagesToChatMessages(wrapped);
+    const toolCalls = (
+      message as { tool_calls?: { function: { arguments: string } }[] }
+    ).tool_calls;
+
+    expect(toolCalls).toHaveLength(1);
+    expect(toolCalls?.[0].function.arguments).toBe('{"command":"echo hi"}');
+    expect(toolCalls?.[0].function.arguments).not.toContain("valid");
+  });
+
+  it("strips the validation wrapper on the responses path", () => {
+    const [item] = linguaMessagesToResponsesInput(wrapped) as {
+      arguments?: string;
+    }[];
+
+    expect(item.arguments).toBe('{"command":"echo hi"}');
   });
 });

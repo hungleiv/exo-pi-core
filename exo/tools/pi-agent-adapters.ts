@@ -321,7 +321,17 @@ export function exoMessagesToAgentSeed(
   const systemParts: string[] = [];
   const piMessages: PiMessage[] = [];
   for (const message of messages) {
-    const text = messageText(message);
+    // Assistant turns get text parts only. messageText() would render their
+    // tool_call parts as the literal "[tool_call <name>] {<args>}" prose, and
+    // seeding that into a fresh Agent teaches the model that writing a tool
+    // call as text is how you call a tool - the same leak fixed in
+    // responseToAssistantMessage, just on the across-turns path instead of
+    // the within-turn one. What the prior turn actually did still reaches the
+    // model through the "[prior tool result]" note below.
+    const text =
+      message.role === "assistant"
+        ? assistantTextParts(message).join("")
+        : messageText(message);
     if (!text) {
       continue;
     }
@@ -612,6 +622,29 @@ export function piAssistantText(message: AssistantMessage): string {
     .join("");
 }
 
+// The text a model actually wrote, with no rendering of structured parts.
+// Mirrors contentText()'s handling of the two content shapes (bare string or
+// part array) but keeps only real text, so tool calls and reasoning never
+// reach the transcript as prose.
+function assistantTextParts(message: Message): string[] {
+  const content = message.content;
+  if (typeof content === "string") {
+    return content ? [content] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  return content.flatMap((part) => {
+    if (typeof part !== "object" || part === null) {
+      return [];
+    }
+    const record = part as { type?: unknown; text?: unknown };
+    return record.type === "text" && typeof record.text === "string"
+      ? [record.text]
+      : [];
+  });
+}
+
 function responseToAssistantMessage(
   response: OpenAIResponse,
   model: PiModel<PiApi>,
@@ -622,7 +655,22 @@ function responseToAssistantMessage(
   // ChatCompletionsRuntime (used for OpenRouter and most non-OpenAI-Responses
   // models) leaves it undefined and only fills response.output. Go through
   // the same Lingua-backed extraction the original turn loop uses instead.
-  const text = responseMessages(response).map(messageText).join("");
+  //
+  // Text parts only, deliberately. messageText() runs contentText(), which
+  // renders a tool_call part as the literal string "[tool_call <name>]
+  // {<args>}" (harness/index.ts). Feeding that back in here put every tool
+  // call into the transcript twice: once as fake text, once as the real
+  // structured call - and the model learned from its own history that
+  // writing "[tool_call shell] {...}" as prose is a way to call a tool.
+  // That is exactly the "described a tool call as plain text instead of
+  // actually invoking it" turn the unfinished-turn nudge exists to catch;
+  // measured on pi-core runs burning whole rounds (and sometimes the entire
+  // nudge budget) on turns that called nothing. Same shape as the earlier
+  // {type:"valid",value} wrapper leak: an internal rendering escaping into
+  // history and being imitated.
+  const text = responseMessages(response)
+    .flatMap((message) => assistantTextParts(message))
+    .join("");
   if (text) {
     content.push({ type: "text", text });
   }

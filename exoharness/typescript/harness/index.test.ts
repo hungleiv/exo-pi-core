@@ -552,6 +552,120 @@ describe("shell built-in tool", () => {
     expect(buildTruncatedPreview("small", {})).toBe("small");
   });
 
+  // Boundary and failure cases for the spill decision itself (mirrors the
+  // private SHELL_OUTPUT_SPILL_THRESHOLD_CHARS=4_000 /
+  // SHELL_OUTPUT_SPILL_LIMIT_CHARS=1_000_000 in built-in-tools.ts).
+  it("does not spill output at or under the threshold", async () => {
+    const commands: string[] = [];
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        commands.push(
+          String((request.arguments as { command?: unknown }).command),
+        );
+        return { stdout: "x".repeat(4_000), stderr: "", exit_code: 0 };
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "echo" },
+      { context, toolCallId: "call_exact" },
+    )) as JsonObject;
+
+    expect(result.full_output_path).toBeUndefined();
+    expect(commands).toHaveLength(1);
+  });
+
+  it("spills when stderr alone pushes combined output over the threshold", async () => {
+    const commands: string[] = [];
+    const stderr = "e".repeat(5_000);
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        const command = String(
+          (request.arguments as { command?: unknown }).command,
+        );
+        commands.push(command);
+        if (command.startsWith("mkdir -p --")) {
+          return { stdout: "", stderr: "", exit_code: 0 };
+        }
+        return { stdout: "short\n", stderr, exit_code: 1 };
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "false-ish" },
+      { context, toolCallId: "call_stderr" },
+    )) as JsonObject;
+
+    expect(result.full_output_path).toBe(
+      "/tmp/exo-shell-output/call_stderr.log",
+    );
+    expect(result.full_output_chars).toBe("short\n".length + stderr.length);
+  });
+
+  it("does not spill output beyond the size ceiling", async () => {
+    const commands: string[] = [];
+    const huge = "y".repeat(1_000_001);
+    const context = fakeTurnContext({
+      executeTool: async (request) => {
+        commands.push(
+          String((request.arguments as { command?: unknown }).command),
+        );
+        return { stdout: huge, stderr: "", exit_code: 0 };
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "cat huge-file" },
+      { context, toolCallId: "call_huge" },
+    )) as JsonObject;
+
+    expect(result.full_output_path).toBeUndefined();
+    // Only the original shell invocation ran - no attempt to spill something
+    // this large as a base64 argument on a second call.
+    expect(commands).toHaveLength(1);
+  });
+
+  it("leaves the original result untouched when the spill write itself fails", async () => {
+    const big = "z".repeat(10_000);
+    let calls = 0;
+    const context = fakeTurnContext({
+      executeTool: async () => {
+        calls += 1;
+        if (calls === 1) {
+          return { stdout: big, stderr: "", exit_code: 0 };
+        }
+        throw new Error("sandbox exec failed");
+      },
+    });
+    const shell = createShellToolInstance({
+      shellProgram: "/bin/bash",
+      mounts: [],
+    });
+
+    const result = (await shell!.handler.execute(
+      { command: "seq 1 2000" },
+      { context, toolCallId: "call_writefail" },
+    )) as JsonObject;
+
+    // The spill is a convenience, not a requirement: a broken write must not
+    // surface as a broken tool call.
+    expect(result.full_output_path).toBeUndefined();
+    expect(result.stdout).toBe(big);
+    expect(calls).toBe(2);
+  });
+
   it("leaves small shell output untouched", async () => {
     const commands: string[] = [];
     const context = fakeTurnContext({

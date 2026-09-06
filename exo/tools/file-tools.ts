@@ -44,8 +44,18 @@ const MAX_READ_BYTES = 50 * 1024;
 // with these registered still opened with four shell calls before reaching
 // for edit. So the guidance ships alongside the registration - it is part of
 // the design being tested, not a separate variable.
+// The "no echo/printf redirection" clause was measured live to overreach:
+// gpt-5-nano generalized it from "don't author file content that way" to
+// "don't use echo/cat for anything," including the self-check step at the
+// end of an otherwise-plain shell command (`echo $((n+1)) > f` with no
+// trailing `cat f` to confirm the new value). Across repeated single-
+// increment shell calls that made it lose count silently, where an
+// identically-tooled native-harness agent without this wording kept a
+// trailing `cat` and tracked the count correctly. The fix scopes the ban to
+// authoring content and says explicitly that verifying a command's own
+// result is unaffected.
 export const FILE_TOOLS_INSTRUCTION =
-  "File tools: use write to create a file or replace one entirely, and edit for targeted changes to an existing file. Pass file content verbatim in those tools' arguments. Do not write file content through shell (no heredocs, no echo/printf redirection): shell quoting inside a tool argument is error-prone and write/edit avoid it entirely. Keep using shell to run commands, inspect output, and test what you built.";
+  "File tools: use write to create a file or replace one entirely, and edit for targeted changes to an existing file. Pass file content verbatim in those tools' arguments. Do not author a file's contents through shell (no heredocs, no echo/printf redirection used to write out text): shell quoting inside a tool argument is error-prone and write/edit avoid it entirely. This is only about authoring content - keep using shell to run commands, redirect a command's own computed output, and check results with echo/cat/tail as normal.";
 
 export function registerFileTools(tools: HarnessToolRegistry): void {
   tools.register(writeToolInstance());

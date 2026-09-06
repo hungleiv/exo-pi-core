@@ -28,6 +28,7 @@ import {
   messagesEvent,
   toolResultEvent,
   toolRequestedEvent,
+  unwrapToolArguments,
   type AgentConfig,
   type EventData,
   type JsonObject,
@@ -853,7 +854,7 @@ function buildChatStreamingBody(
   };
 }
 
-function messagesToChatMessages(
+export function messagesToChatMessages(
   messages: Message[],
 ): ChatCompletionMessageParam[] {
   return messages.map(messageToChatMessage);
@@ -1059,15 +1060,23 @@ function assistantToolCalls(content: unknown): ChatCompletionMessageToolCall[] {
     ) {
       return [];
     }
+    // unwrapToolArguments, not the raw value: lingua stores arguments behind a
+    // {type:"valid"|"invalid", value} validation tag, and sending that tag to
+    // the provider shows the model its own past calls in a shape that does not
+    // match the tool's schema. A model then copies the wrapper into its next
+    // call, gets "missing field", sees the failure replayed, and nests deeper -
+    // the runaway that burned ~$9 of credit over 236 rounds. The earlier fix
+    // for that only covered the text rendering in harness/index.ts; this is the
+    // structured path that actually reaches the provider, and the Responses API
+    // path is already clean because lingua unwraps its own tag there.
+    const args = unwrapToolArguments(part.arguments);
     return [
       {
         id: part.tool_call_id,
         type: "function",
         function: {
           name: part.tool_name,
-          arguments: JSON.stringify(
-            isRecord(part.arguments) ? part.arguments : {},
-          ),
+          arguments: JSON.stringify(isRecord(args) ? args : {}),
         },
       },
     ];

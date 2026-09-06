@@ -204,6 +204,49 @@ describe("exoMessagesToAgentSeed", () => {
     const seed = exoMessagesToAgentSeed([{ role: "user", content: "" }]);
     expect(seed.messages).toEqual([]);
   });
+  // Same leak as responseToAssistantMessage, on the across-turns path: a prior
+  // assistant turn's tool calls must not be seeded back as "[tool_call ...]"
+  // prose for the model to imitate. The tool result note still carries what
+  // the turn actually did.
+  it("does not seed prior tool calls as prose", () => {
+    const seed = exoMessagesToAgentSeed([
+      { role: "user", content: "run it" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "on it" },
+          {
+            type: "tool_call",
+            tool_call_id: "call_1",
+            tool_name: "shell",
+            arguments: { command: "echo hi" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool_result",
+            tool_call_id: "call_1",
+            tool_name: "shell",
+            output: { exit_code: 0, stdout: "hi\n", stderr: "" },
+          },
+        ],
+      },
+    ] as never);
+
+    const assistant = seed.messages.filter((m) => m.role === "assistant");
+    expect(assistant).toHaveLength(1);
+    expect(JSON.stringify(assistant[0].content)).not.toContain("[tool_call");
+    expect(JSON.stringify(assistant[0].content)).toContain("on it");
+    // The tool result still reaches the model.
+    expect(
+      seed.messages.some((m) =>
+        String(m.content).includes("[prior tool result]"),
+      ),
+    ).toBe(true);
+  });
 });
 
 describe("buildModelStub", () => {
@@ -461,6 +504,65 @@ describe("createExoStreamFn", () => {
       // drain
     }
     expect(seenUserContent).toBe("look: [image]");
+  });
+
+  // Regression: messageText() renders a tool_call content part as the literal
+  // string "[tool_call <name>] {<args>}". Running the model's own response
+  // through it put every tool call into the transcript twice - once as that
+  // fake prose, once as the real structured call - and the model imitated the
+  // prose form, producing turns that called nothing and burned the
+  // unfinished-turn nudge budget. The assistant text must carry only what the
+  // model actually wrote.
+  it("keeps tool calls out of the assistant text", async () => {
+    const responseWithToolCall = {
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [
+            { type: "output_text", text: "running it", annotations: [] },
+          ],
+        },
+        {
+          id: "call_1_item",
+          type: "function_call",
+          call_id: "call_1",
+          name: "shell",
+          arguments: JSON.stringify({ command: "echo hi" }),
+          status: "completed",
+        },
+      ],
+      usage: { input_tokens: 3, output_tokens: 2 },
+    } as never;
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream() {
+        return responseWithToolCall;
+      },
+    };
+    const streamFn = createExoStreamFn(
+      runtime as ResponsesRuntimeLike,
+      "gpt-5.5",
+    );
+    const stream = await streamFn(model, {
+      messages: [{ role: "user", content: "go", timestamp: Date.now() }],
+    });
+    let final: AssistantMessage | undefined;
+    for await (const event of stream) {
+      if (event.type === "done") {
+        final = event.message;
+      }
+    }
+
+    const textParts = (final?.content ?? []).flatMap((part) =>
+      part.type === "text" ? [part.text] : [],
+    );
+    expect(textParts.join("")).toBe("running it");
+    expect(textParts.join("")).not.toContain("[tool_call");
+    // The real structured call still has to survive.
+    expect(
+      (final?.content ?? []).filter((part) => part.type === "toolCall"),
+    ).toHaveLength(1);
   });
 
   it("streams real deltas as text_start/text_delta/text_end, then start+done", async () => {
