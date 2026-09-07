@@ -225,6 +225,82 @@ describe("write", () => {
   });
 });
 
+// The t8-fuzzyedit failure: a model targets a phrase containing curly
+// punctuation, retypes it with the ASCII lookalikes its own output
+// naturally produces, and exact matching rejects the whole call. Measured
+// 0/5 before this; pi's own edit recovered every time.
+it("matches through curly quotes, apostrophes and dashes", async () => {
+  const { execution, files } = fakeSandboxFs();
+  files.set("/tmp/bx/note.txt", "The motto is: “Don’t stop” — keep going.");
+
+  const result = (await editToolInstance().handler.execute(
+    {
+      path: "/tmp/bx/note.txt",
+      edits: [{ old_text: '"Don\'t stop" - keep', new_text: "ONWARD keep" }],
+    },
+    execution,
+  )) as Record<string, unknown>;
+
+  expect(result.edits_applied).toBe(1);
+  // Reported, not silent: the file differs from what was literally asked for.
+  expect(result.fuzzy_matches).toBe(1);
+  expect(files.get("/tmp/bx/note.txt")).toBe(
+    "The motto is: ONWARD keep going.",
+  );
+});
+
+// Only the matched span is rewritten - normalization must not leak into
+// the rest of the file and quietly flatten punctuation the edit never
+// targeted.
+it("leaves typography outside the edited span untouched", async () => {
+  const { execution, files } = fakeSandboxFs();
+  files.set("/tmp/bx/note.txt", "keep “this” — replace “that” — end");
+
+  await editToolInstance().handler.execute(
+    {
+      path: "/tmp/bx/note.txt",
+      edits: [{ old_text: 'replace "that"', new_text: "REPLACED" }],
+    },
+    execution,
+  );
+
+  expect(files.get("/tmp/bx/note.txt")).toBe("keep “this” — REPLACED — end");
+});
+
+it("reports no fuzzy match when the text was found literally", async () => {
+  const { execution, files } = fakeSandboxFs();
+  files.set("/tmp/bx/note.txt", "plain ascii text here");
+
+  const result = (await editToolInstance().handler.execute(
+    {
+      path: "/tmp/bx/note.txt",
+      edits: [{ old_text: "ascii", new_text: "utf8" }],
+    },
+    execution,
+  )) as Record<string, unknown>;
+
+  expect("fuzzy_matches" in result).toBe(false);
+});
+
+// Normalizing must never turn an ambiguous target into an accepted one:
+// guessing which of two identical spots was meant is exactly the mistake
+// the exact-match rule exists to prevent.
+it("still rejects a target that normalizes to more than one place", async () => {
+  const { execution, files } = fakeSandboxFs();
+  files.set("/tmp/bx/note.txt", "say “hi” then say ‘hi’ again");
+
+  await expect(
+    editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/note.txt",
+        edits: [{ old_text: "hi", new_text: "bye" }],
+      },
+      execution,
+    ),
+  ).rejects.toThrow(/must match exactly once/);
+  expect(files.get("/tmp/bx/note.txt")).toBe("say “hi” then say ‘hi’ again");
+});
+
 describe("read", () => {
   it("reads back exactly what was written", async () => {
     const { execution, files } = fakeSandboxFs();

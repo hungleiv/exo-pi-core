@@ -146,20 +146,35 @@ export function editToolInstance(): ToolInstance {
         const path = requireString(args, "path");
         const edits = parseEdits(args.edits);
         let content = await readFile(execution, path);
+        let fuzzyMatches = 0;
         for (const [index, edit] of edits.entries()) {
-          const occurrences = countOccurrences(content, edit.oldText);
-          if (occurrences !== 1) {
+          const located = locateEdit(content, edit.oldText);
+          if (located === null) {
             // Reject the whole call rather than write a partial edit: the file
             // on disk stays as it was, so the model can re-read and retry
             // against known state.
+            const occurrences = countOccurrences(content, edit.oldText);
             throw new Error(
               `edits[${index}].old_text matches ${occurrences} times in ${path} (must match exactly once); file left unchanged`,
             );
           }
-          content = content.replace(edit.oldText, edit.newText);
+          if (located.fuzzy) {
+            fuzzyMatches += 1;
+          }
+          content =
+            content.slice(0, located.index) +
+            edit.newText +
+            content.slice(located.index + edit.oldText.length);
         }
         await writeFile(execution, path, content);
-        return { path, edits_applied: edits.length };
+        return {
+          path,
+          edits_applied: edits.length,
+          // Reported rather than silent: the file now differs from what the
+          // model literally asked for at those spots, and it should be able
+          // to tell that from the result instead of guessing.
+          ...(fuzzyMatches > 0 ? { fuzzy_matches: fuzzyMatches } : {}),
+        };
       },
     },
   };
@@ -430,6 +445,60 @@ function parseEdits(value: unknown): FileEdit[] {
     }
     return { oldText, newText };
   });
+}
+
+// Finds where an edit applies, falling back to typographic normalization when
+// the literal text is not there.
+//
+// The failure this exists for, measured on the t8-fuzzyedit benchmark case:
+// a model targets a phrase containing curly quotes, an apostrophe or an
+// em-dash, retypes it with the plain ASCII equivalents its own output
+// naturally produces, and an exact-match edit rejects the call outright -
+// 0/5 on that case, while pi-agent-core's edit (which normalizes first)
+// recovered every time. The file, not the model, is the odd one out here:
+// the text is "the same" to any reader.
+//
+// Returns null when there is no single unambiguous target, which keeps the
+// existing all-or-nothing contract: ambiguity is never resolved by guessing.
+function locateEdit(
+  content: string,
+  oldText: string,
+): { index: number; fuzzy: boolean } | null {
+  if (oldText.length === 0) {
+    return null;
+  }
+  if (countOccurrences(content, oldText) === 1) {
+    return { index: content.indexOf(oldText), fuzzy: false };
+  }
+  // More than one literal hit is genuine ambiguity - normalizing can only
+  // make that worse, never better - so only a clean miss falls through here.
+  if (countOccurrences(content, oldText) > 1) {
+    return null;
+  }
+
+  const normalizedContent = normalizeTypography(content);
+  const normalizedOld = normalizeTypography(oldText);
+  if (countOccurrences(normalizedContent, normalizedOld) !== 1) {
+    return null;
+  }
+  // Safe because normalizeTypography is strictly character-for-character:
+  // every substitution is one code point for one code point, so offsets in
+  // the normalized string are the same offsets in the original. That is why
+  // this deliberately skips the two normalizations pi also applies - NFKC
+  // and per-line trimEnd - which change length and would need the original
+  // positions mapped back.
+  return { index: normalizedContent.indexOf(normalizedOld), fuzzy: true };
+}
+
+// Same character classes pi's normalizeForFuzzyMatch folds, minus the two
+// length-changing steps. These cover what models actually get wrong:
+// retyping typographic punctuation as its ASCII lookalike.
+function normalizeTypography(text: string): string {
+  return text
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
+    .replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
 }
 
 function countOccurrences(haystack: string, needle: string): number {
