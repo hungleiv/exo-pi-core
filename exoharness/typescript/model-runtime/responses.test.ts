@@ -194,3 +194,75 @@ describe("tool-call argument replay", () => {
     expect(item.arguments).toBe('{"command":"echo hi"}');
   });
 });
+
+describe("user message image parts", () => {
+  // This module is shared by every harness in the repo, several of which are
+  // untouched benchmark baselines, so the image branch must be unreachable
+  // for content that carries no image part.
+  it("leaves ordinary user content as a plain string", () => {
+    const [message] = messagesToChatMessages([
+      { role: "user", content: "just text" },
+    ] as never);
+
+    expect(message).toEqual({ role: "user", content: "just text" });
+  });
+
+  it("keeps flattening a part array that has no image in it", () => {
+    const [message] = messagesToChatMessages([
+      { role: "user", content: [{ type: "text", text: "hello" }] },
+    ] as never);
+
+    expect(typeof (message as { content: unknown }).content).toBe("string");
+  });
+
+  it("sends raw base64 as a data URL built from media_type", () => {
+    const [message] = messagesToChatMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "look:" },
+          { type: "image", image: "QUJD", media_type: "image/png" },
+        ],
+      },
+    ] as never);
+
+    expect(message).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "look:" },
+        {
+          type: "image_url",
+          image_url: { url: "data:image/png;base64,QUJD" },
+        },
+      ],
+    });
+  });
+
+  it("passes an http or data URL through untouched", () => {
+    const [message] = messagesToChatMessages([
+      {
+        role: "user",
+        content: [
+          { type: "image", image: "https://example.com/a.png" },
+          { type: "image", image: "data:image/gif;base64,R0lG" },
+        ],
+      },
+    ] as never);
+
+    expect((message as { content: unknown[] }).content).toEqual([
+      { type: "image_url", image_url: { url: "https://example.com/a.png" } },
+      { type: "image_url", image_url: { url: "data:image/gif;base64,R0lG" } },
+    ]);
+  });
+
+  it("falls back to image/jpeg when media_type is absent", () => {
+    const [message] = messagesToChatMessages([
+      { role: "user", content: [{ type: "image", image: "QUJD" }] },
+    ] as never);
+
+    expect(
+      (message as { content: { image_url: { url: string } }[] }).content[0]
+        .image_url.url,
+    ).toBe("data:image/jpeg;base64,QUJD");
+  });
+});

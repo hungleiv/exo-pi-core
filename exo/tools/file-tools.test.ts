@@ -48,8 +48,14 @@ function fakeShellExecution(
 // tests don't need a real container: write pipes base64 through `base64 -d`,
 // read pipes a file through `base64`. Good enough to exercise the tools'
 // own logic (encoding, error propagation, truncation) rather than bash's.
+// `files` holds text, encoded as UTF-8 on the way out, which is what almost
+// every test wants. `binary` is a separate channel for files whose bytes are
+// not text at all - an image's 0x89 byte does not survive a round trip through
+// a UTF-8 string, so storing one in `files` would silently corrupt it and the
+// test would be asserting against the corruption.
 function fakeSandboxFs() {
   const files = new Map<string, string>();
+  const binary = new Map<string, Buffer>();
   const execution = fakeShellExecution((command) => {
     const writeMatch = command.match(
       /printf %s '((?:[^'\\]|\\.)*)' \| base64 -d > '((?:[^'\\]|\\.)*)'/,
@@ -67,6 +73,14 @@ function fakeSandboxFs() {
     );
     if (readMatch) {
       const path = fakePath(unquote(readMatch[1]));
+      const rawBytes = binary.get(path);
+      if (rawBytes) {
+        return {
+          exit_code: 0,
+          stdout: rawBytes.toString("base64"),
+          stderr: "",
+        };
+      }
       if (!files.has(path)) {
         // Real base64 exits non-zero on a missing file; pipefail (added after
         // the incident this file's header describes) is what makes that
@@ -85,7 +99,7 @@ function fakeSandboxFs() {
     }
     throw new Error(`unrecognized command in fake sandbox: ${command}`);
   });
-  return { execution, files };
+  return { execution, files, binary };
 }
 
 function unquote(shellSingleQuoted: string): string {
@@ -798,5 +812,92 @@ describe("mixed line endings", () => {
     );
 
     expect(files.get("/tmp/bx/mixed2.txt")).toBe("ALPHA\r\nBETA\ngamma\r\n");
+  });
+});
+
+describe("read of an image file", () => {
+  // A 1x1 PNG. Decoding these bytes as UTF-8 - which is what read did before -
+  // yields replacement-character noise that costs context and tells the model
+  // nothing, with no argument it could retry with to get the real thing.
+  const PNG_1X1 = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    "base64",
+  );
+
+  it("returns the image as base64 with its media type, not as text", async () => {
+    const { execution, binary } = fakeSandboxFs();
+    binary.set("/tmp/bx/dot.png", PNG_1X1);
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/dot.png", offset: null, limit: null },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.media_type).toBe("image/png");
+    expect(result.bytes).toBe(PNG_1X1.length);
+    expect(result.image_base64).toBe(PNG_1X1.toString("base64"));
+    // The text-shaped fields must be absent: an image has no lines to page.
+    expect("content" in result).toBe(false);
+    expect("next_offset" in result).toBe(false);
+  });
+
+  it("detects jpeg, gif and webp by signature", async () => {
+    const cases: [string, Buffer, string][] = [
+      [
+        "/tmp/bx/a.jpg",
+        Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00]),
+        "image/jpeg",
+      ],
+      ["/tmp/bx/a.gif", Buffer.from("GIF89a-rest"), "image/gif"],
+      [
+        "/tmp/bx/a.webp",
+        Buffer.concat([
+          Buffer.from("RIFF"),
+          Buffer.from([0, 0, 0, 0]),
+          Buffer.from("WEBPmore"),
+        ]),
+        "image/webp",
+      ],
+    ];
+    for (const [path, bytes, expected] of cases) {
+      const { execution, binary } = fakeSandboxFs();
+      binary.set(path, bytes);
+      const result = (await readToolInstance().handler.execute(
+        { path, offset: null, limit: null },
+        execution,
+      )) as Record<string, unknown>;
+      expect(result.media_type).toBe(expected);
+    }
+  });
+
+  it("still reads a text file that merely mentions PNG as text", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/notes.txt", "PNG is a format\nGIF is another");
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/notes.txt", offset: null, limit: null },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.content).toBe("PNG is a format\nGIF is another");
+    expect("media_type" in result).toBe(false);
+  });
+
+  // The sandbox has a shell, so the model can act on this rather than being
+  // told only that it failed.
+  it("refuses an oversized image with a recoverable instruction", async () => {
+    const { execution, binary } = fakeSandboxFs();
+    const huge = Buffer.concat([
+      Buffer.from([0xff, 0xd8, 0xff]),
+      Buffer.alloc(4 * 1024 * 1024),
+    ]);
+    binary.set("/tmp/bx/huge.jpg", huge);
+
+    await expect(
+      readToolInstance().handler.execute(
+        { path: "/tmp/bx/huge.jpg", offset: null, limit: null },
+        execution,
+      ),
+    ).rejects.toThrow(/resize it first/);
   });
 });

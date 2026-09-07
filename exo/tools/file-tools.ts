@@ -231,7 +231,7 @@ export function readToolInstance(): ToolInstance {
     definition: {
       name: "read",
       description:
-        "Read a file from the sandbox. Long files are truncated; when that happens the result says how many lines remain and which offset to pass to continue from there. Use offset/limit to page through a file instead of re-reading it whole - this is also how to recover the part of a large shell result that was cut off, after writing it to a file.",
+        "Read a file from the sandbox. Text and images (png, jpeg, gif, webp) are both supported; an image is returned as a picture you can look at, so read it rather than trying to inspect its bytes. Long text files are truncated; when that happens the result says how many lines remain and which offset to pass to continue from there. Use offset/limit to page through a file instead of re-reading it whole - this is also how to recover the part of a large shell result that was cut off, after writing it to a file.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -262,7 +262,34 @@ export function readToolInstance(): ToolInstance {
         const path = requireString(args, "path");
         const offset = optionalPositiveInteger(args, "offset");
         const limit = optionalPositiveInteger(args, "limit");
-        const content = await readFile(execution, path);
+        const bytes = await readFileBytes(execution, path);
+
+        // Images are returned as an image, not as their bytes rendered into
+        // text. Decoding PNG bytes as UTF-8 produces replacement-character
+        // noise that costs a lot of context and tells the model nothing, and
+        // it has no way to recover from that - there is no "read this as an
+        // image" argument it could retry with.
+        const mediaType = detectImageMediaType(bytes);
+        if (mediaType !== null) {
+          if (bytes.length > MAX_READ_IMAGE_BYTES) {
+            // Actionable rather than a bare refusal: the sandbox has a shell,
+            // so the model can shrink the file itself and read it again.
+            throw new Error(
+              `${path} is a ${mediaType} image of ${formatBytes(bytes.length)}, over the ${formatBytes(MAX_READ_IMAGE_BYTES)} limit; resize it first (e.g. shell: convert or ffmpeg) and read the smaller file`,
+            );
+          }
+          return {
+            path,
+            media_type: mediaType,
+            bytes: bytes.length,
+            // Read by the pi-core adapter, which turns it into a real image
+            // content part and keeps it out of the tool-result text. See
+            // pi-agent-adapters.ts's imageResultParts.
+            image_base64: bytes.toString("base64"),
+          };
+        }
+
+        const content = bytes.toString("utf8");
         const page = readPage(content, offset, limit);
         return {
           path,
@@ -514,10 +541,65 @@ async function writeFile(
   }
 }
 
+// Image formats every vision-capable model behind OpenRouter's chat API
+// accepts. Deliberately narrower than pi's detectSupportedImageMimeType
+// (harness/tools/image.js), which also reports image/bmp - pi only emits BMP
+// when an imageProcessor is configured to convert it, and there is none here,
+// so claiming support would produce a request the provider rejects.
+//
+// Signature checks only, no decoding: the point is to tell "this is an image"
+// from "this is text", not to validate the file.
+function detectImageMediaType(bytes: Buffer): string | null {
+  if (bytes.length >= 4 && bytes.subarray(0, 3).equals(JPEG_SIGNATURE)) {
+    return "image/jpeg";
+  }
+  if (bytes.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    return "image/png";
+  }
+  if (bytes.subarray(0, 3).toString("ascii") === "GIF") {
+    return "image/gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes.subarray(0, 4).toString("ascii") === "RIFF" &&
+    bytes.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return "image/webp";
+  }
+  return null;
+}
+
+const JPEG_SIGNATURE = Buffer.from([0xff, 0xd8, 0xff]);
+const PNG_SIGNATURE = Buffer.from([
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+]);
+
+// Images bypass MAX_READ_BYTES, which is a line-oriented text budget, so they
+// need a budget of their own. An image costs context in proportion to its
+// pixels, and there is no resizer in this harness (pi auto-resizes via an
+// injected imageProcessor; nothing supplies one here), so the cap is the only
+// thing standing between one screenshot and a blown context window.
+const MAX_READ_IMAGE_BYTES = 3 * 1024 * 1024;
+
+function formatBytes(count: number): string {
+  return count < 1024
+    ? `${count}B`
+    : count < 1024 * 1024
+      ? `${(count / 1024).toFixed(1)}KB`
+      : `${(count / (1024 * 1024)).toFixed(1)}MB`;
+}
+
 async function readFile(
   execution: ToolExecutionContext,
   path: string,
 ): Promise<string> {
+  return (await readFileBytes(execution, path)).toString("utf8");
+}
+
+async function readFileBytes(
+  execution: ToolExecutionContext,
+  path: string,
+): Promise<Buffer> {
   const quotedPath = shellQuote(path);
   // Without pipefail, a pipeline's exit code is the *last* command's - and
   // `tr` succeeds even on empty input, so a failing `base64` (e.g. missing
@@ -532,7 +614,7 @@ async function readFile(
       `read failed for ${path} (exit ${outcome.exitCode}): ${outcome.stderr.trim() || "no stderr"}`,
     );
   }
-  return Buffer.from(outcome.stdout.trim(), "base64").toString("utf8");
+  return Buffer.from(outcome.stdout.trim(), "base64");
 }
 
 interface ShellOutcome {

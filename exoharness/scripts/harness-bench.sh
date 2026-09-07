@@ -28,7 +28,7 @@ EXO=./target/debug/exo
 # whose prompt demands a bare number at the end grades the actual answer
 # rather than anything the model said while working.
 # ---------------------------------------------------------------------------
-CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report t7-batchedcounter t8-fuzzyedit)
+CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report t7-batchedcounter t8-fuzzyedit t9-readimage)
 
 case_tier() {
   case "$1" in
@@ -60,6 +60,13 @@ case_tier() {
     # silently. Only meaningful on the two pi-core file-tool variants; other
     # harnesses don't have two edit implementations to tell apart.
     t8-*) echo "8-fuzzy-edit-match" ;;
+    # The last capability gap against pi-agent-core's own read tool
+    # (harness/tools/read.js returns images as attachments; Exo's read
+    # decoded their bytes as UTF-8). Grades on the model naming a
+    # two-digit number that appears ONLY as pixels - it is nowhere in the
+    # prompt, the filename or the base64's decoded text - so a pass means
+    # the image really reached the model, not that it guessed.
+    t9-*) echo "9-read-image" ;;
   esac
 }
 
@@ -79,6 +86,7 @@ case_expect() {
     t6-report)    echo '(^|[^0-9])3([^0-9]|$)' ;;
     t7-batchedcounter) echo '(^|[^0-9])5([^0-9]|$)' ;;
     t8-fuzzyedit) echo '(^|[^0-9])1([^0-9]|$)' ;;
+    t9-readimage) echo '(^|[^0-9])47([^0-9]|$)' ;;
   esac
 }
 
@@ -132,6 +140,8 @@ This script is meant to sum the EVEN numbers from 1 to 10 (2+4+6+8+10), but it h
       printf '%s' "In /tmp/t8, create note.txt containing exactly this single line - use the exact curly quotes and dash shown, do not substitute plain ASCII punctuation when WRITING the file:
 The motto is: “Don’t stop believing” — keep going.
 Then, in a single targeted text-replacement edit tool call, replace that quoted phrase with “Never give up” - but write the old_text/oldText argument using plain straight ASCII punctuation instead of the file's curly one: target it as \"Don't stop believing\" (a plain straight double-quote, a plain straight apostrophe, a plain straight double-quote - not the curly characters the file actually contains). This mismatch against the file's real curly punctuation is intentional - do not read the file back first and do not silently correct old_text to curly quotes; call edit directly with the plain-ASCII old_text as instructed even though it does not byte-for-byte match the file. If that edit call is rejected, do not switch to write or shell to force the change - report the failure by finishing your reply with the number 0 instead of a matching count. If the edit call succeeds, then run: grep -c 'Never give up' /tmp/t8/note.txt and finish your reply with that command's output as a bare number." ;;
+    t9-readimage)
+      printf '%s' "In /tmp/t9, write this base64 to /tmp/t9/pic.png using shell: printf %s 'iVBORw0KGgoAAAANSUhEUgAAAIwAAABQCAAAAADuV8K2AAACjklEQVR42u3aTUhUURQHcF8hohTaNH5gUGEUIbTIlSAILQqSsE+whUL0BQqamboVd0JDJC2iRCwsMIKEPqBMWtSqWpSrNoX5UVqTOEwiKOZp0/H9h5p6954r9wX3rO7Dc//zmzszb97cp0cZ4ak1GQ7jMA7jMA7jMA7jMKuBueql1MeUP8a8AFVkDDPWHqKVOT0XHsy14fC8Z8bbQvQGPvM9PJieofB8tCdajTzIViOYs0kjmGYTmN7HRixbjgXtpPQ1mctiDyaMUpDaDTMuUcD6G6aK01qzVDFPYUJu0gCmj9N2zCtj9sGEdpJjPuX9CvNekCpmBPozJw1gDnBaEyljaqG/juSYmxxWMqeMGc+E/hE55vMGfpGekTKmBdr3khxTzWH1pIxJrIf2J3JMP2dtTqpjuqB7F4kx05HUJ6aEWSiG7htyzCHOOkXqmF5oLl4QY25z1qaEOma5FJq7SIr5spGzHpI65gH0rpsVY47+dr5SwVRC7zmSYgY4qmhGA/MSWteOSjFfo5w1SBoYvHapISlmJe04aWDe49XaaynmLiflx3UwDdBZSUJMvICj7pAGJp4NnfelmBpOOkI6mA5o3LksxfBlb2RaBzMfhcbrqhZK9+ugu1Dnd0DfN39cUKc+P83K/LPe/OGZ/dgGDZ1kbGW06t4Hf5zdYHkb7SKMT0TtYp6/gtzzljcYcWEObreLefcIDi5Y3nqNwY3g8gq7mKlbcKC3r2MO073oj0sO62UEOhsF+DpI5kHPFdIqYyvTk/DHkZN27x0sXYaD+hy7mIEJf5zVaPmuSgzGtYV2MUOwPeS1WL7fhN8E+0vtYt4Oi0945jC4MGV7tGM8959FDuMwDuMwDuMw/wnmJ99nqUTapDn9AAAAAElFTkSuQmCC' | base64 -d > /tmp/t9/pic.png . Then call the read tool on /tmp/t9/pic.png. The image shows a number. Finish your reply with that number as a bare number on its own line. Do not guess: if the read tool does not let you see the image, finish with 0 instead." ;;
   esac
 }
 

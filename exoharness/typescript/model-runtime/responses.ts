@@ -42,6 +42,7 @@ import type {
   ChatCompletion,
   ChatCompletionChunk,
   ChatCompletionCreateParamsNonStreaming,
+  ChatCompletionContentPart,
   ChatCompletionCreateParamsStreaming,
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
@@ -865,7 +866,7 @@ function messageToChatMessage(message: Message): ChatCompletionMessageParam {
     return { role: "system", content: messageContentText(message.content) };
   }
   if (message.role === "user") {
-    return { role: "user", content: messageContentText(message.content) };
+    return { role: "user", content: userMessageContent(message.content) };
   }
   if (message.role === "tool") {
     const result = toolResultContent(message.content);
@@ -1110,6 +1111,81 @@ function toolResultContent(content: unknown): {
     toolCallId: part.tool_call_id,
     output: part.output,
   };
+}
+
+// A user message whose content carries image parts has to travel as an array
+// of typed parts; anything else keeps the plain-string form it has always had.
+//
+// Deliberately narrow. Without the image branch this function is exactly
+// messageContentText, and no harness that does not build image parts can take
+// a different path through it - the flattening below is reached only when an
+// image part is actually present. That matters here because this module is
+// shared by every harness in the repo, several of which exist only as
+// unchanged benchmark baselines.
+//
+// Shape and conversion mirror the Rust runtime rather than inventing a second
+// convention: parts are {type:"image", image, media_type} as built by
+// crates/executor/src/adapter/runtime.rs's download_inbound_images, and raw
+// base64 becomes a data: URL exactly as lingua's OpenAI converter does
+// (providers/openai/convert.rs, UserContentPart::Image), leaving an http(s)
+// or data: URL untouched.
+function userMessageContent(
+  content: unknown,
+): string | ChatCompletionContentPart[] {
+  if (!Array.isArray(content) || !content.some(isImagePart)) {
+    return messageContentText(content);
+  }
+  const parts: ChatCompletionContentPart[] = [];
+  for (const part of content) {
+    if (isImagePart(part)) {
+      parts.push({ type: "image_url", image_url: { url: imagePartUrl(part) } });
+      continue;
+    }
+    // Any non-image part rides along as text, using the same flattening the
+    // string form would have applied to it.
+    const text = messageContentText(
+      isTextPart(part) ? part.text : (part ?? ""),
+    );
+    if (text !== "") {
+      parts.push({ type: "text", text });
+    }
+  }
+  return parts;
+}
+
+interface ImageContentPart {
+  type: "image";
+  image: string;
+  media_type?: string | null;
+}
+
+function isImagePart(part: unknown): part is ImageContentPart {
+  return (
+    part !== null &&
+    typeof part === "object" &&
+    (part as { type?: unknown }).type === "image" &&
+    typeof (part as { image?: unknown }).image === "string"
+  );
+}
+
+function isTextPart(part: unknown): part is { type: "text"; text: string } {
+  return (
+    part !== null &&
+    typeof part === "object" &&
+    (part as { type?: unknown }).type === "text" &&
+    typeof (part as { text?: unknown }).text === "string"
+  );
+}
+
+function imagePartUrl(part: ImageContentPart): string {
+  if (
+    part.image.startsWith("data:") ||
+    part.image.startsWith("http://") ||
+    part.image.startsWith("https://")
+  ) {
+    return part.image;
+  }
+  return `data:${part.media_type ?? "image/jpeg"};base64,${part.image}`;
 }
 
 function messageContentText(content: unknown): string {

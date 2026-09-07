@@ -878,3 +878,106 @@ describe("looksLikeUnfinishedTurn", () => {
     expect(looksLikeUnfinishedTurn({ role: "assistant" })).toBe(false);
   });
 });
+
+describe("image tool results", () => {
+  const model = buildModelStub("gpt-5.5");
+
+  function fakeResponse() {
+    return {
+      output: [
+        {
+          type: "message",
+          role: "assistant",
+          status: "completed",
+          content: [{ type: "output_text", text: "ok", annotations: [] }],
+        },
+      ],
+      usage: { input_tokens: 1, output_tokens: 1 },
+    } as never;
+  }
+
+  function imageToolResult(id: string, data: string) {
+    return {
+      role: "toolResult",
+      toolCallId: id,
+      toolName: "read",
+      content: [
+        { type: "text", text: "Read image file /tmp/a.png [image/png]" },
+        { type: "image", data, mimeType: "image/png" },
+      ],
+      details: { path: "/tmp/a.png", media_type: "image/png", bytes: 3 },
+      timestamp: Date.now(),
+    };
+  }
+
+  async function capture(messages: unknown[]) {
+    let seen: unknown;
+    const runtime: Pick<ResponsesRuntimeLike, "completeStream"> = {
+      async completeStream(request) {
+        seen = request.messages;
+        return fakeResponse();
+      },
+    };
+    const streamFn = createExoStreamFn(
+      runtime as ResponsesRuntimeLike,
+      "gpt-5.5",
+    );
+    const stream = await streamFn(model, { messages } as never);
+    for await (const _event of stream) {
+      // drain
+    }
+    return seen as { role: string; content: unknown }[];
+  }
+
+  // A "tool" role message's content must be a string on the OpenAI chat API,
+  // which is the path OpenRouter takes, so the image cannot ride inside the
+  // tool result the way it does on Anthropic's API. It follows as a user
+  // message instead - the one role whose content may be typed parts.
+  it("sends the image as a user message after the tool result", async () => {
+    const messages = await capture([imageToolResult("c1", "QUJD")]);
+
+    expect(messages.map((m) => m.role)).toEqual(["tool", "user"]);
+    expect(messages[1].content).toEqual([
+      { type: "text", text: "Image content of the read result above:" },
+      { type: "image", image: "QUJD", media_type: "image/png" },
+    ]);
+  });
+
+  it("keeps the base64 out of the tool message itself", async () => {
+    const messages = await capture([imageToolResult("c1", "QUJD")]);
+
+    expect(JSON.stringify(messages[0])).not.toContain("QUJD");
+  });
+
+  // A tool result stays in pi's context for the rest of the turn and the
+  // request is rebuilt every round, so without this an image is re-uploaded
+  // on every round until the turn ends.
+  it("sends only the newest image when several have been read", async () => {
+    const messages = await capture([
+      imageToolResult("c1", "T0xE"),
+      imageToolResult("c2", "TkVX"),
+    ]);
+
+    const images = JSON.stringify(messages);
+    expect(images).toContain("TkVX");
+    expect(images).not.toContain("T0xE");
+    // The older result keeps its text line, so the model still knows it read
+    // that file - it just cannot re-examine the picture without reading again.
+    expect(messages.map((m) => m.role)).toEqual(["tool", "tool", "user"]);
+  });
+
+  it("leaves a text-only tool result as a single message", async () => {
+    const messages = await capture([
+      {
+        role: "toolResult",
+        toolCallId: "c1",
+        toolName: "shell",
+        content: [{ type: "text", text: "hi" }],
+        details: { stdout: "hi" },
+        timestamp: Date.now(),
+      },
+    ]);
+
+    expect(messages.map((m) => m.role)).toEqual(["tool"]);
+  });
+});

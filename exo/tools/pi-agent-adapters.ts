@@ -167,6 +167,16 @@ export function toolInstanceToAgentTool(
       if (isToolFailure(result)) {
         throw new Error(toolFailureMessage(result));
       }
+      // An image result is routed around compaction entirely: its bulk is
+      // base64 that must reach the provider intact, so truncating it to a
+      // preview would destroy the one thing it carries, and writing it to an
+      // artifact would only hide it. imageResultParts strips the base64 out
+      // of the tool-result text instead, so the transcript keeps just the
+      // metadata and the pixels travel as a real image part.
+      const image = imageResultParts(result);
+      if (image !== null) {
+        return image;
+      }
       const compacted = await compactToolResultForModel(
         context,
         tool.definition.name,
@@ -272,6 +282,48 @@ async function compactToolResultForModel(
       sizeBytes: artifact.sizeBytes,
     },
   };
+}
+
+// Recognises the shape file-tools.ts's `read` returns for an image and turns
+// it into pi's own image content block.
+//
+// The split between content and details is the whole point. pi's convention
+// (AgentToolResult: content is "returned to the model", details is "for logs
+// or UI rendering") is inverted in this adapter - piMessageToExoMessage
+// replays `details` into the transcript - so the base64 goes in `content`,
+// where the image part is read from, and `details` keeps only the metadata.
+// Putting it in both would send every pixel twice and then keep one copy in
+// context for the rest of the turn.
+function imageResultParts(result: unknown): AgentToolResult<unknown> | null {
+  const record = asRecord(result);
+  const mediaType = record?.media_type;
+  const data = record?.image_base64;
+  if (typeof mediaType !== "string" || typeof data !== "string") {
+    return null;
+  }
+  const { image_base64: _omitted, ...metadata } = record as Record<
+    string,
+    unknown
+  >;
+  return {
+    content: [
+      // The text part is what a model that cannot see the image is left with,
+      // and what the transcript shows on later rounds, so it names the file
+      // rather than just announcing that an image happened.
+      {
+        type: "text",
+        text: `Read image file ${String(record?.path ?? "")} [${mediaType}]`,
+      },
+      { type: "image", data, mimeType: mediaType },
+    ] as AgentToolResult<unknown>["content"],
+    details: metadata,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
 function sanitizePathSegment(value: string): string {
@@ -624,8 +676,30 @@ function piContextToNativeRequest(
   if (context.systemPrompt) {
     messages.push({ role: "developer", content: context.systemPrompt });
   }
-  for (const message of context.messages) {
-    messages.push(piMessageToExoMessage(message));
+  // Only the newest image is sent as an image; earlier ones fall back to
+  // their text line.
+  //
+  // A tool result stays in pi's context for the rest of the turn and this
+  // function runs once per round, so without this an image is re-uploaded on
+  // every round until the turn ends - a 3MB screenshot over a ten-round task
+  // is 40MB of upload and its full token cost paid ten times. The text part
+  // stays, so the model still knows the file was read and what it was; what
+  // it loses is the ability to re-examine an older picture, which it can
+  // recover by reading the file again.
+  // Not findLastIndex: the tsconfig lib target predates it.
+  let newestImageIndex = -1;
+  for (const [index, message] of context.messages.entries()) {
+    if (
+      message.role === "toolResult" &&
+      piImageParts(message.content).length > 0
+    ) {
+      newestImageIndex = index;
+    }
+  }
+  for (const [index, message] of context.messages.entries()) {
+    messages.push(
+      ...piMessageToExoMessages(message, index === newestImageIndex),
+    );
   }
   return {
     model,
@@ -636,6 +710,72 @@ function piContextToNativeRequest(
       parameters: tool.parameters as unknown as JsonValue,
     })),
   };
+}
+
+// One pi message usually becomes one Exo message, with a single exception:
+// a tool result carrying an image becomes two.
+//
+// The reason is a hard API constraint, not a preference. A "tool" role
+// message's content must be a string on the OpenAI chat API, which is the
+// path OpenRouter takes (responses.ts: isOpenRouterBinding -> the chat
+// completions body), so there is nowhere in it for an image to go. pi does
+// not hit this because pi-ai talks to Anthropic's Messages API, where a
+// tool_result block may itself contain an image (api/anthropic-messages.js).
+//
+// So the tool message keeps the metadata, and the image follows it as a user
+// message - the one role whose content may be an array of typed parts. The
+// model sees the tool call answered, then sees the picture.
+function piMessageToExoMessages(
+  message: PiMessage,
+  keepImages: boolean,
+): Message[] {
+  const primary = piMessageToExoMessage(message);
+  if (message.role !== "toolResult" || !keepImages) {
+    return [primary];
+  }
+  const images = piImageParts(message.content);
+  if (images.length === 0) {
+    return [primary];
+  }
+  return [
+    primary,
+    {
+      role: "user",
+      content: [
+        {
+          type: "text",
+          text: `Image content of the ${message.toolName} result above:`,
+        },
+        ...images,
+      ] as unknown as JsonValue,
+    },
+  ];
+}
+
+// Maps pi's image block ({type:"image", data, mimeType}) onto the shape Exo's
+// own runtime uses for one ({type:"image", image, media_type} - see
+// crates/executor/src/adapter/runtime.rs's download_inbound_images), which is
+// what responses.ts renders into an image_url part.
+function piImageParts(content: unknown): JsonValue[] {
+  if (!Array.isArray(content)) {
+    return [];
+  }
+  const parts: JsonValue[] = [];
+  for (const part of content) {
+    const record = asRecord(part);
+    if (
+      record?.type === "image" &&
+      typeof record.data === "string" &&
+      typeof record.mimeType === "string"
+    ) {
+      parts.push({
+        type: "image",
+        image: record.data,
+        media_type: record.mimeType,
+      });
+    }
+  }
+  return parts;
 }
 
 function piMessageToExoMessage(message: PiMessage): Message {
