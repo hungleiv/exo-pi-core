@@ -34,7 +34,7 @@
 // Rust core or the event log's durability guarantees, only the fidelity of
 // what gets recorded from this particular harness.
 
-import { Agent } from "@earendil-works/pi-agent-core";
+import { Agent, type AgentTool } from "@earendil-works/pi-agent-core";
 
 import {
   createToolRegistry,
@@ -92,6 +92,11 @@ export interface PiCoreTurnOptions {
     tools: HarnessToolRegistry,
     context: TurnContext,
   ) => Promise<void> | void;
+  // Tools handed straight to the Agent instead of through Exo's ToolInstance
+  // registry. pi's own harness tools (createReadTool and friends) are
+  // AgentHarnessTool - AgentTool plus a resolved-context argument - so they
+  // have no ToolInstance shape to register, but the Agent takes them as-is.
+  extraAgentTools?: (context: TurnContext) => AgentTool[];
 }
 
 export async function runPiCoreTurn(
@@ -122,9 +127,10 @@ export async function runPiCoreTurn(
   // buildModelStub. 0 means "unknown", and compaction stays off.
   const contextWindow = lookupContextWindow(modelBinding.model);
   const model = buildModelStub(modelBinding.model, contextWindow);
-  const agentTools = tools
-    .instances()
-    .map((tool) => toolInstanceToAgentTool(tool, context));
+  const agentTools = [
+    ...tools.instances().map((tool) => toolInstanceToAgentTool(tool, context)),
+    ...(options.extraAgentTools?.(context) ?? []),
+  ];
 
   // Config-audit findings (both silent gaps against the default harness,
   // neither surfaced by benchmarking so far):
