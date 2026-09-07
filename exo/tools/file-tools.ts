@@ -145,7 +145,8 @@ export function editToolInstance(): ToolInstance {
         rejectUnknownArguments(args, ["path", "edits"]);
         const path = requireString(args, "path");
         const edits = parseEdits(args.edits);
-        let content = await readFile(execution, path);
+        const originalContent = await readFile(execution, path);
+        let content = originalContent;
         let fuzzyMatches = 0;
         for (const [index, edit] of edits.entries()) {
           const located = locateEdit(content, edit.oldText);
@@ -167,6 +168,7 @@ export function editToolInstance(): ToolInstance {
             content.slice(located.index + edit.oldText.length);
         }
         await writeFile(execution, path, content);
+        const change = summarizeChange(originalContent, content);
         return {
           path,
           edits_applied: edits.length,
@@ -174,6 +176,12 @@ export function editToolInstance(): ToolInstance {
           // model literally asked for at those spots, and it should be able
           // to tell that from the result instead of guessing.
           ...(fuzzyMatches > 0 ? { fuzzy_matches: fuzzyMatches } : {}),
+          ...(change === null
+            ? {}
+            : {
+                first_changed_line: change.firstChangedLine,
+                diff: change.diff,
+              }),
         };
       },
     },
@@ -445,6 +453,88 @@ function parseEdits(value: unknown): FileEdit[] {
     }
     return { oldText, newText };
   });
+}
+
+// A compact before/after view of what the edit actually did.
+//
+// The model needs this most now that matching can be fuzzy: when
+// normalization resolved the target, the bytes written differ from the
+// old_text the model typed, and without seeing the result it has no way to
+// notice. It also catches the plain case of an edit that landed somewhere
+// other than intended.
+//
+// Deliberately not a full unified patch. This result goes through
+// compactToolResultForModel, which cuts a tool result to ~4,000 characters -
+// a whole-file diff would be truncated into uselessness on any real file,
+// and would crowd out the rest of the result. Only the changed region plus a
+// couple of lines of context is reported, and even that is capped.
+const DIFF_CONTEXT_LINES = 2;
+const DIFF_MAX_LINES = 40;
+
+function summarizeChange(
+  before: string,
+  after: string,
+): { firstChangedLine: number; diff: string } | null {
+  if (before === after) {
+    return null;
+  }
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+
+  // Trim the identical head and tail so only the changed span is described.
+  let start = 0;
+  while (
+    start < beforeLines.length &&
+    start < afterLines.length &&
+    beforeLines[start] === afterLines[start]
+  ) {
+    start += 1;
+  }
+  let fromEnd = 0;
+  while (
+    fromEnd < beforeLines.length - start &&
+    fromEnd < afterLines.length - start &&
+    beforeLines[beforeLines.length - 1 - fromEnd] ===
+      afterLines[afterLines.length - 1 - fromEnd]
+  ) {
+    fromEnd += 1;
+  }
+
+  const contextStart = Math.max(start - DIFF_CONTEXT_LINES, 0);
+  const removed = beforeLines.slice(start, beforeLines.length - fromEnd);
+  const added = afterLines.slice(start, afterLines.length - fromEnd);
+  const contextBefore = beforeLines.slice(contextStart, start);
+  const contextAfter = afterLines.slice(
+    afterLines.length - fromEnd,
+    Math.min(
+      afterLines.length - fromEnd + DIFF_CONTEXT_LINES,
+      afterLines.length,
+    ),
+  );
+
+  const lines: string[] = [];
+  contextBefore.forEach((line, i) => {
+    lines.push(`  ${contextStart + i + 1} ${line}`);
+  });
+  removed.forEach((line, i) => {
+    lines.push(`- ${start + i + 1} ${line}`);
+  });
+  added.forEach((line, i) => {
+    lines.push(`+ ${start + i + 1} ${line}`);
+  });
+  contextAfter.forEach((line, i) => {
+    lines.push(`  ${afterLines.length - fromEnd + i + 1} ${line}`);
+  });
+
+  const capped =
+    lines.length > DIFF_MAX_LINES
+      ? [
+          ...lines.slice(0, DIFF_MAX_LINES),
+          `  ... ${lines.length - DIFF_MAX_LINES} more diff line(s) not shown`,
+        ]
+      : lines;
+
+  return { firstChangedLine: start + 1, diff: capped.join("\n") };
 }
 
 // Finds where an edit applies, falling back to typographic normalization when

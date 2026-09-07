@@ -377,7 +377,91 @@ describe("edit", () => {
     expect(result).toEqual({
       path: "/tmp/bx/greeting.txt",
       edits_applied: 1,
+      first_changed_line: 1,
+      diff: "- 1 hello world\n+ 1 hello there",
     });
+  });
+
+  // A model that only sees "edits_applied: 1" cannot tell an edit that
+  // landed where it meant from one that did not - and after fuzzy matching
+  // the bytes written may differ from the old_text it typed. The diff is
+  // what makes that visible without a follow-up read.
+  it("reports the changed region with line numbers and context", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set(
+      "/tmp/bx/poem.txt",
+      ["alpha", "beta", "gamma", "delta", "epsilon"].join("\n"),
+    );
+
+    const result = (await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/poem.txt",
+        edits: [{ old_text: "gamma", new_text: "GAMMA" }],
+      },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.first_changed_line).toBe(3);
+    expect(result.diff).toBe(
+      [
+        "  1 alpha",
+        "  2 beta",
+        "- 3 gamma",
+        "+ 3 GAMMA",
+        "  4 delta",
+        "  5 epsilon",
+      ].join("\n"),
+    );
+  });
+
+  // The result travels through compactToolResultForModel, which cuts a tool
+  // result to ~4,000 characters. A whole-file diff would be truncated into
+  // uselessness, so a large rewrite has to report a bounded excerpt instead.
+  it("caps the diff instead of dumping a whole rewritten file", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set(
+      "/tmp/bx/big.txt",
+      Array.from({ length: 500 }, (_, i) => `old-line-${i}`).join("\n"),
+    );
+
+    const result = (await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/big.txt",
+        edits: [
+          {
+            old_text: Array.from(
+              { length: 500 },
+              (_, i) => `old-line-${i}`,
+            ).join("\n"),
+            new_text: Array.from(
+              { length: 500 },
+              (_, i) => `new-line-${i}`,
+            ).join("\n"),
+          },
+        ],
+      },
+      execution,
+    )) as Record<string, unknown>;
+
+    const diffLines = String(result.diff).split("\n");
+    expect(diffLines.length).toBeLessThanOrEqual(41);
+    expect(diffLines.at(-1)).toMatch(/more diff line\(s\) not shown/);
+  });
+
+  it("omits diff fields when an edit changes nothing", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/same.txt", "unchanged");
+
+    const result = (await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/same.txt",
+        edits: [{ old_text: "unchanged", new_text: "unchanged" }],
+      },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect("diff" in result).toBe(false);
+    expect("first_changed_line" in result).toBe(false);
   });
 
   it("applies multiple edits in order", async () => {
