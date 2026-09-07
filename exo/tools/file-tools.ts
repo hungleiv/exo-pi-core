@@ -91,7 +91,12 @@ export function writeToolInstance(): ToolInstance {
         rejectUnknownArguments(args, ["path", "content"]);
         const path = requireString(args, "path");
         const content = requireString(args, "content");
-        await writeFile(execution, path, content);
+        // Under the same lock as edit: a write racing an edit on one path
+        // loses the same way two edits do, and the queue is per path, so an
+        // unlocked write would simply step over a held lock.
+        await withFileLock(execution, path, () =>
+          writeFile(execution, path, content),
+        );
         return {
           path,
           bytes_written: Buffer.byteLength(content, "utf8"),
@@ -145,58 +150,76 @@ export function editToolInstance(): ToolInstance {
         rejectUnknownArguments(args, ["path", "edits"]);
         const path = requireString(args, "path");
         const edits = parseEdits(args.edits);
-        const originalContent = await readFile(execution, path);
-        let content = originalContent;
-        let fuzzyMatches = 0;
-        const hunks: { firstChangedLine: number; diff: string }[] = [];
-        for (const [index, edit] of edits.entries()) {
-          const located = locateEdit(content, edit.oldText);
-          if (located === null) {
-            // Reject the whole call rather than write a partial edit: the file
-            // on disk stays as it was, so the model can re-read and retry
-            // against known state.
-            const occurrences = countOccurrences(content, edit.oldText);
-            throw new Error(
-              `edits[${index}].old_text matches ${occurrences} times in ${path} (must match exactly once); file left unchanged`,
-            );
+        return withFileLock(execution, path, async () => {
+          const originalText = await readFile(execution, path);
+          const lineEnding = detectLineEnding(originalText);
+          // null means mixed endings: leave the bytes alone and match exactly,
+          // which is what this tool did before line-ending handling existed.
+          const normalize = lineEnding === null ? identity : normalizeToLF;
+          // Everything below - matching, fuzzy fallback, diff line numbers -
+          // works on LF text, and the original ending is put back at the end.
+          let content = normalize(originalText);
+          // The model reads text and writes old_text with \n even when the file
+          // is CRLF, so its arguments are normalized the same way.
+          const normalizedEdits = edits.map((edit) => ({
+            oldText: normalize(edit.oldText),
+            newText: normalize(edit.newText),
+          }));
+          let fuzzyMatches = 0;
+          const hunks: { firstChangedLine: number; diff: string }[] = [];
+          for (const [index, edit] of normalizedEdits.entries()) {
+            const located = locateEdit(content, edit.oldText);
+            if (located === null) {
+              // Reject the whole call rather than write a partial edit: the file
+              // on disk stays as it was, so the model can re-read and retry
+              // against known state.
+              const occurrences = countOccurrences(content, edit.oldText);
+              throw new Error(
+                `edits[${index}].old_text matches ${occurrences} times in ${path} (must match exactly once); file left unchanged`,
+              );
+            }
+            if (located.fuzzy) {
+              fuzzyMatches += 1;
+            }
+            const beforeThisEdit = content;
+            content =
+              content.slice(0, located.index) +
+              edit.newText +
+              content.slice(located.index + edit.oldText.length);
+            // Per edit, not once at the end. A single before/after comparison
+            // cannot tell two distant changes apart - it reports everything
+            // between them as one enormous changed region. Measured: two edits
+            // at lines 3 and 200 of a 300-line file produced a 401-line "diff"
+            // that the cap then trimmed to 40 lines of unchanged context, with
+            // the second change never visible. Each edit changes exactly one
+            // contiguous span, so summarizing them one at a time is both
+            // correct and cheap.
+            const hunk = summarizeChange(beforeThisEdit, content);
+            if (hunk !== null) {
+              hunks.push(hunk);
+            }
           }
-          if (located.fuzzy) {
-            fuzzyMatches += 1;
-          }
-          const beforeThisEdit = content;
-          content =
-            content.slice(0, located.index) +
-            edit.newText +
-            content.slice(located.index + edit.oldText.length);
-          // Per edit, not once at the end. A single before/after comparison
-          // cannot tell two distant changes apart - it reports everything
-          // between them as one enormous changed region. Measured: two edits
-          // at lines 3 and 200 of a 300-line file produced a 401-line "diff"
-          // that the cap then trimmed to 40 lines of unchanged context, with
-          // the second change never visible. Each edit changes exactly one
-          // contiguous span, so summarizing them one at a time is both
-          // correct and cheap.
-          const hunk = summarizeChange(beforeThisEdit, content);
-          if (hunk !== null) {
-            hunks.push(hunk);
-          }
-        }
-        await writeFile(execution, path, content);
-        const change = mergeHunks(hunks);
-        return {
-          path,
-          edits_applied: edits.length,
-          // Reported rather than silent: the file now differs from what the
-          // model literally asked for at those spots, and it should be able
-          // to tell that from the result instead of guessing.
-          ...(fuzzyMatches > 0 ? { fuzzy_matches: fuzzyMatches } : {}),
-          ...(change === null
-            ? {}
-            : {
-                first_changed_line: change.firstChangedLine,
-                diff: change.diff,
-              }),
-        };
+          await writeFile(
+            execution,
+            path,
+            restoreLineEndings(content, lineEnding),
+          );
+          const change = mergeHunks(hunks);
+          return {
+            path,
+            edits_applied: edits.length,
+            // Reported rather than silent: the file now differs from what the
+            // model literally asked for at those spots, and it should be able
+            // to tell that from the result instead of guessing.
+            ...(fuzzyMatches > 0 ? { fuzzy_matches: fuzzyMatches } : {}),
+            ...(change === null
+              ? {}
+              : {
+                  first_changed_line: change.firstChangedLine,
+                  diff: change.diff,
+                }),
+          };
+        });
       },
     },
   };
@@ -323,6 +346,155 @@ function optionalPositiveInteger(
 // context.executeTool({functionName: "shell"}), which the Rust core runs in
 // the sandbox. Content therefore travels as base64 in both directions, which
 // is exactly what keeps it out of the shell's parser.
+
+// Serializes mutations of the same file within one turn.
+//
+// Not load-bearing today, and the comment should say so rather than imply a
+// live bug: harness-pi-core.ts:205 sets toolExecution "sequential", so a
+// round's tool calls never overlap and the race below cannot currently
+// happen. What this replaces is the *reason* that blunt setting exists. Its
+// own comment (harness-pi-core.ts:150-157) gives one justification - Exo's
+// tools share a sandbox filesystem and could race on the same files - and
+// serializing every tool call in the harness is a very wide answer to a
+// narrow hazard, paid for on every multi-call round including ones that
+// touch no files at all.
+//
+// The hazard itself is real: `edit` is read-modify-write with an await
+// between the read and the write, so under parallel execution two edits to
+// one file both read the original and the second write silently discards the
+// first. No error, no tool_error - the call reports success and the change is
+// gone. pi handles it precisely, with withFileMutationQueue (dist/harness/
+// tools/file-mutation-queue.js) keyed by canonical path, and leaves its loop
+// parallel. This is the same idea, keyed by TurnContext rather than
+// ExecutionEnv because that is the object that is stable across the tool
+// calls of a turn here.
+//
+// So this exists to make lifting toolExecution "sequential" a decision that
+// can be made on measured latency rather than blocked on a correctness
+// worry. It does NOT lift it - that needs its own benchmark, since the other
+// half of that setting's justification is shell calls racing each other,
+// which a per-file lock does nothing about.
+//
+// Two deliberate simplifications against pi's version:
+//   - the key is computed synchronously, so registration needs no separate
+//     serialization step. pi's key comes from an async canonicalPath call,
+//     which is why it carries a `registration` promise chain to stop two
+//     callers from both observing the same predecessor; between the get and
+//     the set below there is no await, so that race cannot happen here.
+//   - no symlink resolution, so two paths aliasing one file through a
+//     symlink still race. Resolving it costs a sandbox round-trip per edit,
+//     and the failure it would prevent has not been observed; the syntactic
+//     normalization below covers the case that actually shows up, which is
+//     the same file addressed as /a//b and /a/./b.
+const fileMutationQueues = new WeakMap<object, Map<string, Promise<void>>>();
+
+async function withFileLock<T>(
+  execution: ToolExecutionContext,
+  path: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const scope = execution.context as unknown as object;
+  let queues = fileMutationQueues.get(scope);
+  if (queues === undefined) {
+    queues = new Map();
+    fileMutationQueues.set(scope, queues);
+  }
+  const key = normalizePathKey(path);
+
+  // Nothing awaits between reading `previous` and storing `chained`, so each
+  // caller observes a distinct predecessor.
+  const previous = queues.get(key) ?? Promise.resolve();
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = previous.then(() => held);
+  queues.set(key, chained);
+
+  // `previous` cannot reject: it is either Promise.resolve() or an earlier
+  // `chained`, and every `held` is resolved from the finally below - a failing
+  // operation rejects to its own caller, never into the queue.
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    // Only if no later caller has already chained onto this entry, otherwise
+    // the next waiter loses its predecessor.
+    if (queues.get(key) === chained) {
+      queues.delete(key);
+    }
+  }
+}
+
+// Syntactic only - see the symlink note above.
+function normalizePathKey(path: string): string {
+  const segments: string[] = [];
+  for (const segment of path.split("/")) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  return `${path.startsWith("/") ? "/" : ""}${segments.join("/")}`;
+}
+
+// Line-ending handling, mirroring pi's edit-diff.js. Without this an edit
+// against a CRLF file fails outright: the model writes old_text with \n (it
+// is reading text, not bytes), the file holds \r\n, so the match count is
+// zero and the edit is rejected. normalizeTypography does not rescue it
+// either - it never touches \r. Normalize on the way in, restore on the way
+// out, so the file keeps the line endings it arrived with.
+//
+// pi also strips a BOM around its edits (stripBom in edit-diff.js). That is
+// deliberately not copied: a BOM is a single leading character, so exact
+// matching runs straight past it and writing the unchanged content back
+// preserves it anyway. Tested by removing the strip and watching the test
+// still pass - it guards nothing here, and code that guards nothing is worse
+// than no code, because it implies a hazard that was handled.
+//
+// Stricter than pi here on one case: pi decides from the *first* line ending
+// it sees and then rewrites the whole file to it (detectLineEnding +
+// restoreLineEndings in edit-diff.js), so editing one line of a mixed-ending
+// file silently converts every other line too. This returns null for mixed
+// files instead, and the caller then matches against the raw bytes exactly as
+// it did before line-ending handling existed. A mixed file is rare, but
+// rewriting lines the model never asked about is the kind of silent damage
+// this whole change is meant to prevent.
+function detectLineEnding(content: string): "\n" | "\r\n" | null {
+  if (!content.includes("\r")) {
+    return "\n";
+  }
+  // Pure CRLF means every \r is part of a \r\n and every \n is preceded by
+  // one, so removing all \r\n leaves neither behind. Anything else - a bare
+  // \r, or an \n without its \r - is mixed.
+  const withoutCrlf = content.replaceAll("\r\n", "");
+  return withoutCrlf.includes("\r") || withoutCrlf.includes("\n")
+    ? null
+    : "\r\n";
+}
+
+// Only ever called on text whose file is pure LF or pure CRLF, so a bare \r
+// cannot reach it - it is left out rather than handled, because converting one
+// would be an unrequested change to a byte the model never mentioned.
+function normalizeToLF(text: string): string {
+  return text.replaceAll("\r\n", "\n");
+}
+
+function identity(text: string): string {
+  return text;
+}
+
+function restoreLineEndings(
+  text: string,
+  ending: "\n" | "\r\n" | null,
+): string {
+  return ending === "\r\n" ? text.replaceAll("\n", "\r\n") : text;
+}
 
 async function writeFile(
   execution: ToolExecutionContext,

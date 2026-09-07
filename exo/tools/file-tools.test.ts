@@ -57,7 +57,7 @@ function fakeSandboxFs() {
     if (writeMatch) {
       const [, encoded, path] = writeMatch;
       files.set(
-        unquote(path),
+        fakePath(unquote(path)),
         Buffer.from(unquote(encoded), "base64").toString("utf8"),
       );
       return { exit_code: 0, stdout: "", stderr: "" };
@@ -66,7 +66,7 @@ function fakeSandboxFs() {
       /set -o pipefail && base64 < '((?:[^'\\]|\\.)*)' \| tr -d '\\n'/,
     );
     if (readMatch) {
-      const path = unquote(readMatch[1]);
+      const path = fakePath(unquote(readMatch[1]));
       if (!files.has(path)) {
         // Real base64 exits non-zero on a missing file; pipefail (added after
         // the incident this file's header describes) is what makes that
@@ -90,6 +90,14 @@ function fakeSandboxFs() {
 
 function unquote(shellSingleQuoted: string): string {
   return shellSingleQuoted.replaceAll("'\\''", "'");
+}
+
+// A Map keyed by the literal path string would treat /a//b and /a/./b as two
+// different files; a real filesystem does not. Collapsing them here keeps the
+// fake honest about which spellings address one file.
+function fakePath(path: string): string {
+  const segments = path.split("/").filter((s) => s !== "" && s !== ".");
+  return `${path.startsWith("/") ? "/" : ""}${segments.join("/")}`;
 }
 
 describe("write", () => {
@@ -560,5 +568,235 @@ describe("edit", () => {
         execution,
       ),
     ).rejects.toThrow("tool argument dryRun is not allowed");
+  });
+});
+
+describe("line endings and BOM", () => {
+  it("edits a CRLF file using old_text written with plain newlines", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/crlf.txt", "alpha\r\nbeta\r\ngamma\r\n");
+
+    // The model reads text, not bytes, so it writes \n even though the file
+    // on disk is \r\n. Before normalization this matched zero times and the
+    // edit was rejected outright.
+    const result = await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/crlf.txt",
+        edits: [{ old_text: "beta\ngamma", new_text: "beta\ndelta" }],
+      },
+      execution,
+    );
+
+    expect((result as { edits_applied: number }).edits_applied).toBe(1);
+    // Rewritten with the endings it arrived with, not silently converted.
+    expect(files.get("/tmp/bx/crlf.txt")).toBe("alpha\r\nbeta\r\ndelta\r\n");
+  });
+
+  it("keeps a file's CRLF endings when new_text spans lines", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/crlf2.txt", "one\r\ntwo\r\n");
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/crlf2.txt",
+        edits: [{ old_text: "two", new_text: "two\nthree" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/crlf2.txt")).toBe("one\r\ntwo\r\nthree\r\n");
+  });
+
+  // A BOM needs no special handling here - see the note above
+  // detectLineEnding in file-tools.ts - but it must survive an edit, which is
+  // what this pins.
+  it("leaves a BOM in place across an edit", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/bom.txt", "﻿header\nbody\n");
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/bom.txt",
+        edits: [{ old_text: "header", new_text: "title" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/bom.txt")).toBe("﻿title\nbody\n");
+  });
+
+  it("leaves an LF file on LF", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/lf.txt", "one\ntwo\n");
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/lf.txt",
+        edits: [{ old_text: "two", new_text: "three" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/lf.txt")).toBe("one\nthree\n");
+  });
+});
+
+describe("concurrent mutation of one file", () => {
+  // harness-pi-core.ts currently sets toolExecution "sequential", so these
+  // overlaps cannot arise in production today - these tests exercise the
+  // per-file lock directly, by calling the tools concurrently the way a
+  // parallel loop would. See the note above withFileLock for why the lock
+  // exists anyway: it is what would let that harness-wide serialization be
+  // reconsidered on latency grounds instead of correctness ones.
+  it("applies both edits when two edit calls target the same file", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/shared.txt", "alpha\nbeta\n");
+
+    await Promise.all([
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx/shared.txt",
+          edits: [{ old_text: "alpha", new_text: "ALPHA" }],
+        },
+        execution,
+      ),
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx/shared.txt",
+          edits: [{ old_text: "beta", new_text: "BETA" }],
+        },
+        execution,
+      ),
+    ]);
+
+    expect(files.get("/tmp/bx/shared.txt")).toBe("ALPHA\nBETA\n");
+  });
+
+  it("does not serialize edits to different files", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/one.txt", "x");
+    files.set("/tmp/bx/two.txt", "x");
+
+    await Promise.all([
+      editToolInstance().handler.execute(
+        { path: "/tmp/bx/one.txt", edits: [{ old_text: "x", new_text: "1" }] },
+        execution,
+      ),
+      editToolInstance().handler.execute(
+        { path: "/tmp/bx/two.txt", edits: [{ old_text: "x", new_text: "2" }] },
+        execution,
+      ),
+    ]);
+
+    expect(files.get("/tmp/bx/one.txt")).toBe("1");
+    expect(files.get("/tmp/bx/two.txt")).toBe("2");
+  });
+
+  it("treats /a//b and /a/./b as the same file", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/alias.txt", "alpha\nbeta\n");
+
+    await Promise.all([
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx//alias.txt",
+          edits: [{ old_text: "alpha", new_text: "ALPHA" }],
+        },
+        execution,
+      ),
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/./bx/alias.txt",
+          edits: [{ old_text: "beta", new_text: "BETA" }],
+        },
+        execution,
+      ),
+    ]);
+
+    expect(files.get("/tmp/bx/alias.txt")).toBe("ALPHA\nBETA\n");
+  });
+
+  it("releases the lock when an edit fails, so a later edit still runs", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/after.txt", "alpha\n");
+
+    const results = await Promise.allSettled([
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx/after.txt",
+          edits: [{ old_text: "missing", new_text: "x" }],
+        },
+        execution,
+      ),
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx/after.txt",
+          edits: [{ old_text: "alpha", new_text: "ALPHA" }],
+        },
+        execution,
+      ),
+    ]);
+
+    expect(results[0].status).toBe("rejected");
+    expect(results[1].status).toBe("fulfilled");
+    expect(files.get("/tmp/bx/after.txt")).toBe("ALPHA\n");
+  });
+
+  it("serializes a write against an edit on the same file", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/mixed.txt", "alpha\n");
+
+    await Promise.all([
+      editToolInstance().handler.execute(
+        {
+          path: "/tmp/bx/mixed.txt",
+          edits: [{ old_text: "alpha", new_text: "ALPHA" }],
+        },
+        execution,
+      ),
+      writeToolInstance().handler.execute(
+        { path: "/tmp/bx/mixed.txt", content: "replaced\n" },
+        execution,
+      ),
+    ]);
+
+    // The write is last in the queue, so it wins - but it ran after the edit
+    // completed rather than on top of a half-finished read-modify-write.
+    expect(files.get("/tmp/bx/mixed.txt")).toBe("replaced\n");
+  });
+});
+
+describe("mixed line endings", () => {
+  // pi would rewrite every line of this file to the ending of its first line.
+  // Leaving untouched lines byte-identical matters more than uniformity.
+  it("does not convert lines the edit never touched", async () => {
+    const { execution, files } = fakeSandboxFs();
+    const mixed = "alpha\r\nbeta\ngamma\r\n";
+    files.set("/tmp/bx/mixed-eol.txt", mixed);
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/mixed-eol.txt",
+        edits: [{ old_text: "gamma", new_text: "delta" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/mixed-eol.txt")).toBe("alpha\r\nbeta\ndelta\r\n");
+  });
+
+  it("still matches exact CRLF old_text in a mixed file", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/mixed2.txt", "alpha\r\nbeta\ngamma\r\n");
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/mixed2.txt",
+        edits: [{ old_text: "alpha\r\nbeta", new_text: "ALPHA\r\nBETA" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/mixed2.txt")).toBe("ALPHA\r\nBETA\ngamma\r\n");
   });
 });

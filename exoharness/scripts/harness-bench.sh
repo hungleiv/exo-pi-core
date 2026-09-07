@@ -28,7 +28,7 @@ EXO=./target/debug/exo
 # whose prompt demands a bare number at the end grades the actual answer
 # rather than anything the model said while working.
 # ---------------------------------------------------------------------------
-CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report t7-batchedcounter)
+CASE_IDS=(t1-arith t1-logic t2-lines t2-sum t3-counter t3-fizzbuzz t4-fixbug t5-multifile t5-pipeline t6-refactor t6-twobugs t6-report t7-batchedcounter t8-fuzzyedit)
 
 case_tier() {
   case "$1" in
@@ -50,6 +50,16 @@ case_tier() {
     # shows up if parallel execution actually happens, so this tier only
     # measures anything on a prompt that forces the model to batch calls.
     t7-*) echo "7-parallel-race" ;;
+    # Targets the one behavioural difference found between Exo's own edit
+    # tool (exo/tools/file-tools.ts, exact-match only) and pi-agent-core's
+    # (harness/tools/edit-diff.js), which falls back to fuzzy matching -
+    # normalizing curly quotes/dashes/trailing whitespace - before giving up.
+    # A model asked to target text containing typographic punctuation
+    # commonly retypes it in plain ASCII when writing oldText, which an
+    # exact-match edit rejects outright and a fuzzy one recovers from
+    # silently. Only meaningful on the two pi-core file-tool variants; other
+    # harnesses don't have two edit implementations to tell apart.
+    t8-*) echo "8-fuzzy-edit-match" ;;
   esac
 }
 
@@ -68,6 +78,7 @@ case_expect() {
     t6-twobugs)   echo '(^|[^0-9])30([^0-9]|$)' ;;
     t6-report)    echo '(^|[^0-9])3([^0-9]|$)' ;;
     t7-batchedcounter) echo '(^|[^0-9])5([^0-9]|$)' ;;
+    t8-fuzzyedit) echo '(^|[^0-9])1([^0-9]|$)' ;;
   esac
 }
 
@@ -117,6 +128,10 @@ This script is meant to sum the EVEN numbers from 1 to 10 (2+4+6+8+10), but it h
       echo "In /tmp/t6c/data, create five files f1.csv through f5.csv containing exactly 2, 4, 6, 1 and 5 lines respectively (any text content, one record per line). Then write /tmp/t6c/count.sh which examines every .csv file in /tmp/t6c/data and echoes how many of them have MORE THAN 3 lines. Run count.sh. Then verify by listing the line count of each file. Finish your reply with the number count.sh printed, as a bare number on its own line." ;;
     t7-batchedcounter)
       echo "In /tmp/t7a, create counter.txt containing 0. Then, in ONE single reply, issue exactly 5 tool calls together (do not wait for any result before issuing the next one, and do not use separate replies) - all 5 must run this exact unmodified command: num=\$(cat /tmp/t7a/counter.txt); sleep 0.2; echo \$((num+1)) > /tmp/t7a/counter.txt . Do not run any other command and do not run any additional increments beyond those 5 - if the final count looks wrong, report it as-is rather than issuing more tool calls to correct it. In your NEXT reply after those 5 calls finish, immediately cat /tmp/t7a/counter.txt once and finish with the number it printed, on its own line, with no further tool calls." ;;
+      t8-fuzzyedit)
+      printf '%s' "In /tmp/t8, create note.txt containing exactly this single line - use the exact curly quotes and dash shown, do not substitute plain ASCII punctuation when WRITING the file:
+The motto is: “Don’t stop believing” — keep going.
+Then, in a single targeted text-replacement edit tool call, replace that quoted phrase with “Never give up” - but write the old_text/oldText argument using plain straight ASCII punctuation instead of the file's curly one: target it as \"Don't stop believing\" (a plain straight double-quote, a plain straight apostrophe, a plain straight double-quote - not the curly characters the file actually contains). This mismatch against the file's real curly punctuation is intentional - do not read the file back first and do not silently correct old_text to curly quotes; call edit directly with the plain-ASCII old_text as instructed even though it does not byte-for-byte match the file. If that edit call is rejected, do not switch to write or shell to force the change - report the failure by finishing your reply with the number 0 instead of a matching count. If the edit call succeeds, then run: grep -c 'Never give up' /tmp/t8/note.txt and finish your reply with that command's output as a bare number." ;;
   esac
 }
 
