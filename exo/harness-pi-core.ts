@@ -53,11 +53,13 @@ import {
   createExoStreamFn,
   createProtectedPathBeforeToolCallHook,
   exoMessagesToAgentSeed,
+  lookupContextWindow,
   looksLikeUnfinishedTurn,
   piEventToExoEvents,
   toolInstanceToAgentTool,
   type PiRecordableEvent,
 } from "./tools/pi-agent-adapters";
+import { compactAgentContext } from "./tools/pi-context-compaction";
 
 // Cap on how many times a single turn will nudge the model to retry an
 // unfinished turn (malformed tool call, or a genuinely empty response)
@@ -115,7 +117,11 @@ export async function runPiCoreTurn(
 
   const modelBinding = await resolveLlmBinding(context);
   const runtime = runtimeFromModelBinding(context.agentConfig, modelBinding);
-  const model = buildModelStub(modelBinding.model);
+  // A real context window (from Exo's own price table) is what makes
+  // transformContext's compaction decision possible at all - see
+  // buildModelStub. 0 means "unknown", and compaction stays off.
+  const contextWindow = lookupContextWindow(modelBinding.model);
+  const model = buildModelStub(modelBinding.model, contextWindow);
   const agentTools = tools
     .instances()
     .map((tool) => toolInstanceToAgentTool(tool, context));
@@ -168,6 +174,28 @@ export async function runPiCoreTurn(
       onTextDelta: (text) => context.stream.text(text),
     }),
     beforeToolCall: createProtectedPathBeforeToolCallHook(),
+    // pi-agent-core's documented seam for context pruning, previously left
+    // unset. Measured 2026-09-07: prompt tokens grow linearly with no ceiling
+    // in either harness (~810/turn here, ~2,980/turn on the default one), so
+    // a long-running conversation eventually just starts failing. The
+    // decision uses pi's own estimateContextTokens/shouldCompact against the
+    // real window; see pi-context-compaction.ts for why the reduction is
+    // local rather than pi's LLM summarizer.
+    transformContext: async (messages) =>
+      compactAgentContext(messages, {
+        contextWindow,
+        onOutcome: (outcome) => {
+          // Instrumentation, not behaviour: compaction silently deleting
+          // history is exactly the kind of thing that must be visible in the
+          // event log afterwards. Failing to record must never cost a turn.
+          void context.exoharness.current.turn
+            .writeArtifactText({
+              path: `pi-core/compaction-${Date.now()}.json`,
+              text: JSON.stringify(outcome),
+            })
+            .catch(() => {});
+        },
+      }),
     toolExecution: "sequential",
     shouldStopAfterTurn: async (turnContext) => {
       completedRounds += 1;

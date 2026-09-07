@@ -159,6 +159,60 @@ describe("toolInstanceToAgentTool", () => {
       artifactId: "artifact-1",
     });
   });
+  // The failure class that cost ~$9: a model copies a wrapper shape it saw in
+  // its own history, or double-encodes the arguments object as a string, and
+  // every call then fails schema validation. prepareArguments runs before
+  // validation, so a salvageable call still executes instead of burning a
+  // round on "missing field".
+  it("repairs double-encoded and wrapper-nested tool arguments", async () => {
+    const seen: Record<string, unknown>[] = [];
+    const agentTool = toolInstanceToAgentTool(
+      tool(async (args) => {
+        seen.push(args);
+        return { ok: true };
+      }),
+      fakeContext(),
+    );
+
+    const cases: unknown[] = [
+      { text: "plain" },
+      JSON.stringify({ text: "encoded-once" }),
+      { type: "valid", value: { text: "wrapped" } },
+      JSON.stringify({ type: "valid", value: { text: "wrapped-and-encoded" } }),
+      { type: "valid", value: { type: "valid", value: { text: "twice" } } },
+    ];
+    for (const raw of cases) {
+      const prepared = agentTool.prepareArguments?.(raw) ?? raw;
+      await agentTool.execute("call_1", prepared as never);
+    }
+
+    expect(seen).toEqual([
+      { text: "plain" },
+      { text: "encoded-once" },
+      { text: "wrapped" },
+      { text: "wrapped-and-encoded" },
+      { text: "twice" },
+    ]);
+  });
+
+  // Repair must not paper over a genuinely wrong shape - that would hide a
+  // real schema mismatch instead of surfacing it.
+  it("leaves unrecognised argument shapes untouched", () => {
+    const agentTool = toolInstanceToAgentTool(
+      tool(async (args) => args),
+      fakeContext(),
+    );
+
+    expect(agentTool.prepareArguments?.("not json")).toBe("not json");
+    expect(agentTool.prepareArguments?.({ text: "fine" })).toEqual({
+      text: "fine",
+    });
+    // A two-key object that merely looks like the wrapper is not one.
+    expect(agentTool.prepareArguments?.({ type: "other", value: 1 })).toEqual({
+      type: "other",
+      value: 1,
+    });
+  });
 });
 
 describe("exoMessagesToAgentSeed", () => {

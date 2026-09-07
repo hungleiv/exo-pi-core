@@ -17,6 +17,15 @@ export default defineConfig({
           import.meta.url,
         ),
       ),
+      // tsconfig.json declares this path too; vitest was missing it, so any
+      // test whose import graph reached cost.ts (turn-loop.ts imports it for
+      // ensureTable) failed to resolve at runtime while still typechecking.
+      "@exo/model-runtime/cost": fileURLToPath(
+        new URL(
+          "./exoharness/typescript/model-runtime/cost.ts",
+          import.meta.url,
+        ),
+      ),
       "@exo/model-runtime/shared": fileURLToPath(
         new URL(
           "./exoharness/typescript/model-runtime/shared.ts",

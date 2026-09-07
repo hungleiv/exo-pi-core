@@ -96,6 +96,7 @@ import {
   toolRequestedEvent,
   toolResultEvent,
   toolResultMessage,
+  unwrapToolArguments,
   type EventData,
   type JsonObject,
   type JsonValue,
@@ -110,6 +111,7 @@ import {
   type ResponsesRuntimeLike,
 } from "@exo/model-runtime/responses";
 import type { Response as OpenAIResponse } from "openai/resources/responses/responses";
+import { getTable, lookup, type ModelEntry } from "@exo/model-runtime/cost";
 
 // Copied from pi-agent-core's own agent.js EMPTY_USAGE default so a
 // synthetic AssistantMessage satisfies the (non-optional) Usage shape.
@@ -135,7 +137,29 @@ export function toolInstanceToAgentTool(
     label: tool.definition.name,
     description: tool.definition.description,
     parameters: tool.definition.parameters as unknown as TSchema,
-    async execute(toolCallId, params): Promise<AgentToolResult<unknown>> {
+    // pi-agent-core's own seam for salvaging tool arguments that arrive in a
+    // shape the schema rejects, run before validation. Wired here because
+    // this exact failure class has already cost real money on this project:
+    // a model that saw {type:"valid",value:{...}} in its own replayed history
+    // copied the wrapper into its next call, got "missing field", and nested
+    // deeper for 236 rounds (~$9). That leak is fixed at the source now, but
+    // a model can still double-encode arguments on its own - free models do
+    // it unprompted - and without this the call just fails and burns a round.
+    prepareArguments(args) {
+      return repairToolArguments(args) as never;
+    },
+    async execute(
+      toolCallId,
+      params,
+      signal,
+    ): Promise<AgentToolResult<unknown>> {
+      // Honour cancellation at the one point this adapter controls. Full
+      // end-to-end abort needs ResponsesRuntimeLike.completeStream() to take
+      // a signal, which is shared native code this harness deliberately does
+      // not change; stopping before a tool runs is what is reachable here.
+      if (signal?.aborted) {
+        throw new Error(`tool call aborted before ${tool.definition.name} ran`);
+      }
       const result = await tool.handler.execute(params as JsonObject, {
         context,
         toolCallId,
@@ -155,6 +179,43 @@ export function toolInstanceToAgentTool(
       };
     },
   };
+}
+
+// Repairs the argument shapes that have actually been observed arriving
+// malformed on this project, and nothing else - an over-eager repair would
+// hide a real schema mismatch instead of surfacing it.
+//
+//   1. A JSON object encoded as a string ("{\"command\":\"ls\"}"). Free models
+//      do this unprompted when they treat the arguments field as text.
+//   2. The {type:"valid"|"invalid", value} validation wrapper. Its source leak
+//      is fixed (see responses.ts's assistantToolCalls), but a model that
+//      already learned the shape mid-conversation keeps emitting it, and
+//      unwrapping costs nothing.
+//
+// Both are applied repeatedly, bounded, because they nest: the runaway
+// transcript reached two levels before anyone noticed.
+function repairToolArguments(args: unknown): unknown {
+  let current = args;
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (typeof current === "string") {
+      const trimmed = current.trim();
+      if (!trimmed.startsWith("{")) {
+        return current;
+      }
+      try {
+        current = JSON.parse(trimmed);
+        continue;
+      } catch {
+        return current;
+      }
+    }
+    const unwrapped = unwrapToolArguments(current);
+    if (unwrapped === current) {
+      return current;
+    }
+    current = unwrapped;
+  }
+  return current;
 }
 
 // Mirrors exoharness/typescript/harness/tools.ts's compactToolResult: large
@@ -380,7 +441,19 @@ function placeholderAssistantMessage(text: string): AssistantMessage {
 // runtimeFromModelBinding; this stub only carries the id through.
 // ---------------------------------------------------------------------------
 
-export function buildModelStub(modelId: string): PiModel<PiApi> {
+// contextWindow was hard-coded to 0, which reads as "unknown" to every pi
+// consumer that takes a window - including shouldCompact(), so compaction
+// could not have worked even once it was wired. The real number is already on
+// this machine: Exo's price table is LiteLLM's
+// model_prices_and_context_window.json, and parseTable() stores each entry's
+// whole JSON object (ModelEntry only *declares* the cost fields), so
+// max_input_tokens is present at runtime under the same key the cost lookup
+// already resolves. Read through a widened local type rather than by editing
+// cost.ts, which is shared with the default harness.
+export function buildModelStub(
+  modelId: string,
+  contextWindow = 0,
+): PiModel<PiApi> {
   return {
     id: modelId,
     name: modelId,
@@ -390,9 +463,23 @@ export function buildModelStub(modelId: string): PiModel<PiApi> {
     reasoning: false,
     input: ["text"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 0,
+    contextWindow,
     maxTokens: 0,
   };
+}
+
+// Returns 0 when the model is unknown to the table, which keeps compaction
+// off rather than guessing a window and truncating a healthy conversation.
+export function lookupContextWindow(modelId: string): number {
+  const table = getTable();
+  if (!table) {
+    return 0;
+  }
+  const entry = lookup(table, modelId) as
+    | (ModelEntry & { max_input_tokens?: number })
+    | undefined;
+  const window = entry?.max_input_tokens;
+  return typeof window === "number" && window > 0 ? window : 0;
 }
 
 // ---------------------------------------------------------------------------
