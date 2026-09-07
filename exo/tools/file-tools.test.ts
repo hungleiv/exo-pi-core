@@ -115,6 +115,89 @@ describe("write", () => {
     expect(files.get("/tmp/bx/tricky.txt")).toBe(content);
   });
 
+  // Paging is the recovery path for a cut-off read, and for the part of a
+  // large shell result that got spilled to a file. Before this, a truncated
+  // read had no way forward except re-reading the file whole - which returns
+  // the same first 2,000 lines again - so a model had to fall back to
+  // `shell tail/sed` instead.
+  it("returns a window and says where to continue from", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set(
+      "/tmp/bx/lines.txt",
+      Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n"),
+    );
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/lines.txt", offset: 3, limit: 2 },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.content).toBe("line3\nline4");
+    expect(result.truncated).toBe(true);
+    expect(result.remaining_lines).toBe(6);
+    expect(result.next_offset).toBe(5);
+  });
+
+  it("reads to the end without reporting a continuation", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/lines.txt", "a\nb\nc");
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/lines.txt", offset: 2, limit: 5 },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.content).toBe("b\nc");
+    expect(result.truncated).toBe(false);
+    // Absent rather than zero: nothing left to read at all.
+    expect("next_offset" in result).toBe(false);
+  });
+
+  // Strict mode has no optional properties, so the model is forced to send
+  // every key and says "unset" by sending null. Treating that as an error
+  // would make the common case fail.
+  it("treats null offset and limit as unset", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/lines.txt", "a\nb");
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/lines.txt", offset: null, limit: null },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.content).toBe("a\nb");
+    expect(result.truncated).toBe(false);
+  });
+
+  it("rejects a nonsense offset instead of silently reading from the start", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set("/tmp/bx/lines.txt", "a\nb");
+
+    await expect(
+      readToolInstance().handler.execute(
+        { path: "/tmp/bx/lines.txt", offset: 0, limit: null },
+        execution,
+      ),
+    ).rejects.toThrow(/offset must be a positive integer or null/);
+  });
+
+  it("still reports a continuation when the size cap cuts the window short", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set(
+      "/tmp/bx/huge.txt",
+      Array.from({ length: 3_000 }, (_, i) => `line${i + 1}`).join("\n"),
+    );
+
+    const result = (await readToolInstance().handler.execute(
+      { path: "/tmp/bx/huge.txt", offset: null, limit: null },
+      execution,
+    )) as Record<string, unknown>;
+
+    expect(result.truncated).toBe(true);
+    expect(result.next_offset).toBe(2_001);
+    expect(result.remaining_lines).toBe(1_000);
+  });
+
   it("rejects arguments outside the declared schema", async () => {
     const { execution } = fakeSandboxFs();
     await expect(

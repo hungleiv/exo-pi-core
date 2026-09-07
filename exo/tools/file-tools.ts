@@ -171,7 +171,7 @@ export function readToolInstance(): ToolInstance {
     definition: {
       name: "read",
       description:
-        "Read a file from the sandbox. Long files are truncated; the result says so when that happens.",
+        "Read a file from the sandbox. Long files are truncated; when that happens the result says how many lines remain and which offset to pass to continue from there. Use offset/limit to page through a file instead of re-reading it whole - this is also how to recover the part of a large shell result that was cut off, after writing it to a file.",
       parameters: {
         type: "object",
         additionalProperties: false,
@@ -180,24 +180,104 @@ export function readToolInstance(): ToolInstance {
             type: "string",
             description: "Absolute path of the file to read in the sandbox.",
           },
+          // Strict mode has no optional properties: every key must be in
+          // `required`, so "not provided" has to be expressed as null.
+          offset: {
+            type: ["integer", "null"],
+            description:
+              "1-indexed line to start reading from. Null reads from the first line.",
+          },
+          limit: {
+            type: ["integer", "null"],
+            description:
+              "Maximum number of lines to return. Null reads as many as the size limit allows.",
+          },
         },
-        required: ["path"],
+        required: ["path", "offset", "limit"],
       },
     },
     handler: {
       async execute(args, execution): Promise<ToolResult> {
-        rejectUnknownArguments(args, ["path"]);
+        rejectUnknownArguments(args, ["path", "offset", "limit"]);
         const path = requireString(args, "path");
+        const offset = optionalPositiveInteger(args, "offset");
+        const limit = optionalPositiveInteger(args, "limit");
         const content = await readFile(execution, path);
-        const truncated = truncate(content);
+        const page = readPage(content, offset, limit);
         return {
           path,
-          content: truncated.text,
-          truncated: truncated.truncated,
+          content: page.text,
+          truncated: page.truncated,
+          // Only present when there is actually more to read, so its absence
+          // means "this is the whole file from here" rather than "unknown".
+          ...(page.nextOffset === null
+            ? {}
+            : {
+                remaining_lines: page.remainingLines,
+                next_offset: page.nextOffset,
+              }),
         };
       },
     },
   };
+}
+
+// Paging exists so a cut-off read has a way forward that is not "read the
+// whole file again". It is also the recovery path for a truncated shell
+// result: built-in-tools.ts spills the full output to a file in the sandbox,
+// and this is what reads the rest of it. Before this, the two halves of that
+// story used different mechanisms - the shell result pointed at a file that
+// `read` could only return the first 2,000 lines of - so a model had to fall
+// back to `shell tail/sed` to see anything past that.
+//
+// Matches pi's own read tool convention (1-indexed offset, a trailing note
+// naming the next offset) so the two behave the same way where they overlap.
+function readPage(
+  content: string,
+  offset: number | undefined,
+  limit: number | undefined,
+): {
+  text: string;
+  truncated: boolean;
+  remainingLines: number;
+  nextOffset: number | null;
+} {
+  const lines = content.split("\n");
+  const start = Math.min((offset ?? 1) - 1, lines.length);
+  const windowed = lines.slice(
+    start,
+    limit === undefined ? undefined : start + limit,
+  );
+
+  // The size cap still applies inside the window: a caller can ask for a
+  // million lines, and the result still has to fit in a tool response.
+  const capped = truncate(windowed.join("\n"));
+  const returnedLines =
+    capped.text.length === 0 ? 0 : capped.text.split("\n").length;
+  const consumedThrough = start + returnedLines;
+  const remainingLines = Math.max(lines.length - consumedThrough, 0);
+
+  return {
+    text: capped.text,
+    truncated: capped.truncated || remainingLines > 0,
+    remainingLines,
+    nextOffset: remainingLines > 0 ? consumedThrough + 1 : null,
+  };
+}
+
+function optionalPositiveInteger(
+  args: JsonObject,
+  key: string,
+): number | undefined {
+  const value = args[key];
+  // null is how strict mode says "not provided", so it is not an error.
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`${key} must be a positive integer or null`);
+  }
+  return value;
 }
 
 // --- sandbox filesystem access -------------------------------------------
