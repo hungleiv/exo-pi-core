@@ -148,6 +148,7 @@ export function editToolInstance(): ToolInstance {
         const originalContent = await readFile(execution, path);
         let content = originalContent;
         let fuzzyMatches = 0;
+        const hunks: { firstChangedLine: number; diff: string }[] = [];
         for (const [index, edit] of edits.entries()) {
           const located = locateEdit(content, edit.oldText);
           if (located === null) {
@@ -162,13 +163,26 @@ export function editToolInstance(): ToolInstance {
           if (located.fuzzy) {
             fuzzyMatches += 1;
           }
+          const beforeThisEdit = content;
           content =
             content.slice(0, located.index) +
             edit.newText +
             content.slice(located.index + edit.oldText.length);
+          // Per edit, not once at the end. A single before/after comparison
+          // cannot tell two distant changes apart - it reports everything
+          // between them as one enormous changed region. Measured: two edits
+          // at lines 3 and 200 of a 300-line file produced a 401-line "diff"
+          // that the cap then trimmed to 40 lines of unchanged context, with
+          // the second change never visible. Each edit changes exactly one
+          // contiguous span, so summarizing them one at a time is both
+          // correct and cheap.
+          const hunk = summarizeChange(beforeThisEdit, content);
+          if (hunk !== null) {
+            hunks.push(hunk);
+          }
         }
         await writeFile(execution, path, content);
-        const change = summarizeChange(originalContent, content);
+        const change = mergeHunks(hunks);
         return {
           path,
           edits_applied: edits.length,
@@ -455,6 +469,37 @@ function parseEdits(value: unknown): FileEdit[] {
   });
 }
 
+// Joins the per-edit summaries into one result, keeping the whole thing
+// inside the size budget. Line numbers are those of the file at the moment
+// each edit ran, which is what the final file reflects too - except when a
+// later edit sits *before* an earlier one and changes the line count, which
+// no single-pass scheme can express anyway.
+function mergeHunks(
+  hunks: { firstChangedLine: number; diff: string }[],
+): { firstChangedLine: number; diff: string } | null {
+  if (hunks.length === 0) {
+    return null;
+  }
+  const lines: string[] = [];
+  hunks.forEach((hunk, index) => {
+    if (index > 0) {
+      lines.push("  ...");
+    }
+    lines.push(...hunk.diff.split("\n"));
+  });
+  const capped =
+    lines.length > DIFF_MAX_LINES
+      ? [
+          ...lines.slice(0, DIFF_MAX_LINES),
+          `  ... ${lines.length - DIFF_MAX_LINES} more diff line(s) not shown`,
+        ]
+      : lines;
+  return {
+    firstChangedLine: Math.min(...hunks.map((hunk) => hunk.firstChangedLine)),
+    diff: capped.join("\n"),
+  };
+}
+
 // A compact before/after view of what the edit actually did.
 //
 // The model needs this most now that matching can be fuzzy: when
@@ -526,15 +571,7 @@ function summarizeChange(
     lines.push(`  ${afterLines.length - fromEnd + i + 1} ${line}`);
   });
 
-  const capped =
-    lines.length > DIFF_MAX_LINES
-      ? [
-          ...lines.slice(0, DIFF_MAX_LINES),
-          `  ... ${lines.length - DIFF_MAX_LINES} more diff line(s) not shown`,
-        ]
-      : lines;
-
-  return { firstChangedLine: start + 1, diff: capped.join("\n") };
+  return { firstChangedLine: start + 1, diff: lines.join("\n") };
 }
 
 // Finds where an edit applies, falling back to typographic normalization when

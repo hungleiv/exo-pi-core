@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+// Mirrors DIFF_MAX_LINES in file-tools.ts.
+const DIFF_LINE_BUDGET = 41;
+
 import type {
   JsonObject,
   ToolExecutionContext,
@@ -417,6 +420,37 @@ describe("edit", () => {
   // The result travels through compactToolResultForModel, which cuts a tool
   // result to ~4,000 characters. A whole-file diff would be truncated into
   // uselessness, so a large rewrite has to report a bounded excerpt instead.
+  // A single before/after comparison reports everything between two distant
+  // changes as one region: measured, edits at lines 3 and 200 of a 300-line
+  // file gave a 401-line "diff" that the cap trimmed to 40 lines of
+  // unchanged context, with the second change never visible at all.
+  it("shows both changes when edits are far apart", async () => {
+    const { execution, files } = fakeSandboxFs();
+    files.set(
+      "/tmp/bx/far.txt",
+      Array.from({ length: 300 }, (_, i) => `line-${i + 1}`).join("\n"),
+    );
+
+    const result = (await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/far.txt",
+        edits: [
+          { old_text: "line-3\nline-4", new_text: "CHANGED-3\nline-4" },
+          { old_text: "line-200\nline-201", new_text: "CHANGED-200\nline-201" },
+        ],
+      },
+      execution,
+    )) as Record<string, unknown>;
+
+    const diff = String(result.diff);
+    expect(result.first_changed_line).toBe(3);
+    // Both edits visible, and the untouched middle is not spelled out.
+    expect(diff).toContain("+ 3 CHANGED-3");
+    expect(diff).toContain("+ 200 CHANGED-200");
+    expect(diff).not.toContain("line-100");
+    expect(diff.split("\n").length).toBeLessThanOrEqual(DIFF_LINE_BUDGET);
+  });
+
   it("caps the diff instead of dumping a whole rewritten file", async () => {
     const { execution, files } = fakeSandboxFs();
     files.set(
