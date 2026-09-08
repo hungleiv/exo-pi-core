@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest";
 // Mirrors DIFF_MAX_LINES in file-tools.ts.
 const DIFF_LINE_BUDGET = 41;
 
+// Linux's MAX_ARG_STRLEN: 32 pages, the per-argument cap that a single
+// `bash -lc <script>` call is measured against.
+const FAKE_MAX_ARG_STRLEN = 131072;
+
 import type {
   JsonObject,
   ToolExecutionContext,
@@ -56,7 +60,22 @@ function fakeShellExecution(
 function fakeSandboxFs() {
   const files = new Map<string, string>();
   const binary = new Map<string, Buffer>();
+  // Partially-written base64, visible only to the chunked write path. A test
+  // asserting on `files` therefore cannot see a half-finished write, which is
+  // the property the staging file exists to provide.
+  const staging = new Map<string, string>();
+  const commandLengths: number[] = [];
   const execution = fakeShellExecution((command) => {
+    // The sandbox seam is one `bash -lc <script>` call, and Linux caps a
+    // single argv element at MAX_ARG_STRLEN (32 pages). Enforcing it here is
+    // what makes the large-write tests real: without it the fake happily
+    // accepts a 200KB command that the kernel rejects with E2BIG, and the
+    // tests pass against a bug that is live in production.
+    if (command.length > FAKE_MAX_ARG_STRLEN) {
+      throw new Error(
+        `failed to start sandbox command: /bin/bash -lc ...\ncaused by: Argument list too long (os error 7)`,
+      );
+    }
     const writeMatch = command.match(
       /printf %s '((?:[^'\\]|\\.)*)' \| base64 -d > '((?:[^'\\]|\\.)*)'/,
     );
@@ -97,9 +116,51 @@ function fakeSandboxFs() {
         stderr: "",
       };
     }
+    // --- chunked write path -------------------------------------------
+    // Modelled closely enough to catch a real ordering mistake: the staging
+    // file accumulates, and only the final mv makes the new content visible
+    // at the target path.
+    const chunkMatch = command.match(
+      /^printf %s '((?:[^'\\]|\\.)*)' (>>?) '((?:[^'\\]|\\.)*)'$/,
+    );
+    if (chunkMatch) {
+      const [, encoded, redirect, path] = chunkMatch;
+      const key = fakePath(unquote(path));
+      const chunk = unquote(encoded);
+      staging.set(
+        key,
+        redirect === ">" ? chunk : (staging.get(key) ?? "") + chunk,
+      );
+      commandLengths.push(command.length);
+      return { exit_code: 0, stdout: "", stderr: "" };
+    }
+    const finalizeMatch = command.match(
+      /^set -o pipefail && base64 -d < '((?:[^'\\]|\\.)*)' > '((?:[^'\\]|\\.)*)' && mv -- '((?:[^'\\]|\\.)*)' '((?:[^'\\]|\\.)*)' && rm -f '((?:[^'\\]|\\.)*)'$/,
+    );
+    if (finalizeMatch) {
+      const stagingKey = fakePath(unquote(finalizeMatch[1]));
+      const target = fakePath(unquote(finalizeMatch[4]));
+      const accumulated = staging.get(stagingKey);
+      if (accumulated === undefined) {
+        return {
+          exit_code: 1,
+          stdout: "",
+          stderr: `base64: ${stagingKey}: No such file or directory`,
+        };
+      }
+      files.set(target, Buffer.from(accumulated, "base64").toString("utf8"));
+      staging.delete(stagingKey);
+      return { exit_code: 0, stdout: "", stderr: "" };
+    }
+    if (/^mkdir -p -- "\$\(dirname -- '.*'\)"$/.test(command)) {
+      return { exit_code: 0, stdout: "", stderr: "" };
+    }
+    if (command.startsWith("rm -f ")) {
+      return { exit_code: 0, stdout: "", stderr: "" };
+    }
     throw new Error(`unrecognized command in fake sandbox: ${command}`);
   });
-  return { execution, files, binary };
+  return { execution, files, binary, staging, commandLengths };
 }
 
 function unquote(shellSingleQuoted: string): string {
@@ -899,5 +960,92 @@ describe("read of an image file", () => {
         execution,
       ),
     ).rejects.toThrow(/resize it first/);
+  });
+});
+
+describe("large file writes", () => {
+  // Linux caps one argv element at MAX_ARG_STRLEN (131072 bytes), and the
+  // whole shell script is one such element. Found live: an agent editing a
+  // 148KB source file got "Argument list too long (os error 7)" and lost the
+  // edit. Anything from ~96KB of content upward was unwritable.
+  function bigText(bytes: number): string {
+    // Repeating but not uniform, so a chunk boundary landing in the wrong
+    // place corrupts the content visibly rather than by luck looking right.
+    let out = "";
+    for (let i = 0; out.length < bytes; i += 1) {
+      out += `line ${i} ${"x".repeat(50)}\n`;
+    }
+    return out.slice(0, bytes);
+  }
+
+  it("writes a file far larger than the single-argument limit", async () => {
+    const { execution, files } = fakeSandboxFs();
+    const content = bigText(400_000);
+
+    await writeToolInstance().handler.execute(
+      { path: "/tmp/bx/big.txt", content },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/big.txt")).toBe(content);
+  });
+
+  it("keeps every shell command under the argv limit", async () => {
+    const { execution, commandLengths } = fakeSandboxFs();
+
+    await writeToolInstance().handler.execute(
+      { path: "/tmp/bx/big.txt", content: bigText(400_000) },
+      execution,
+    );
+
+    expect(commandLengths.length).toBeGreaterThan(1);
+    for (const length of commandLengths) {
+      expect(length).toBeLessThan(FAKE_MAX_ARG_STRLEN);
+    }
+  });
+
+  it("still uses a single command for an ordinary small file", async () => {
+    const { execution, commandLengths, files } = fakeSandboxFs();
+
+    await writeToolInstance().handler.execute(
+      { path: "/tmp/bx/small.txt", content: "hello" },
+      execution,
+    );
+
+    // The chunked path never ran, so it recorded nothing.
+    expect(commandLengths).toEqual([]);
+    expect(files.get("/tmp/bx/small.txt")).toBe("hello");
+  });
+
+  it("leaves the previous content in place until the write completes", async () => {
+    const { execution, files, staging } = fakeSandboxFs();
+    files.set("/tmp/bx/big.txt", "original content");
+    const content = bigText(200_000);
+
+    await writeToolInstance().handler.execute(
+      { path: "/tmp/bx/big.txt", content },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/big.txt")).toBe(content);
+    // Staging cleaned up rather than left behind next to the real file.
+    expect([...staging.keys()]).toEqual([]);
+  });
+
+  it("edits a large existing file end to end", async () => {
+    const { execution, files } = fakeSandboxFs();
+    const content = `${bigText(200_000)}\nNEEDLE marker line\n`;
+    files.set("/tmp/bx/big.ts", content);
+
+    await editToolInstance().handler.execute(
+      {
+        path: "/tmp/bx/big.ts",
+        edits: [{ old_text: "NEEDLE marker line", new_text: "REPLACED line" }],
+      },
+      execution,
+    );
+
+    expect(files.get("/tmp/bx/big.ts")).toContain("REPLACED line");
+    expect(files.get("/tmp/bx/big.ts")).not.toContain("NEEDLE");
   });
 });

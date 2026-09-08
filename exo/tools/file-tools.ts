@@ -523,6 +523,24 @@ function restoreLineEndings(
   return ending === "\r\n" ? text.replaceAll("\n", "\r\n") : text;
 }
 
+// Base64 payload above which the single-command path is abandoned for the
+// chunked one.
+//
+// Linux caps a *single* argv element at MAX_ARG_STRLEN, 32 pages = 131072
+// bytes, independently of the much larger total ARG_MAX. The only seam into
+// the sandbox is one shell command string, which arrives as `bash -lc
+// <script>` - one argv element - so the whole script, base64 payload
+// included, is measured against that per-element cap.
+//
+// Found live, not by inspection: an agent editing crates/cli/src/main.rs
+// (148KB source, ~198KB base64) got "Argument list too long (os error 7)"
+// and the edit was lost. Every file from roughly 96KB of content upward was
+// unwritable, which is an ordinary source file, not an edge case.
+//
+// 64KB leaves room for the mkdir/printf/redirect boilerplate and the path
+// without needing to reason about their exact lengths.
+const MAX_BASE64_PER_COMMAND = 64 * 1024;
+
 async function writeFile(
   execution: ToolExecutionContext,
   path: string,
@@ -530,9 +548,58 @@ async function writeFile(
 ): Promise<void> {
   const encoded = Buffer.from(content, "utf8").toString("base64");
   const quotedPath = shellQuote(path);
-  const command =
-    `mkdir -p -- "$(dirname -- ${quotedPath})" && ` +
-    `printf %s ${shellQuote(encoded)} | base64 -d > ${quotedPath}`;
+  const makeDirectory = `mkdir -p -- "$(dirname -- ${quotedPath})"`;
+
+  if (encoded.length <= MAX_BASE64_PER_COMMAND) {
+    await runWriteStep(
+      execution,
+      path,
+      `${makeDirectory} && printf %s ${shellQuote(encoded)} | base64 -d > ${quotedPath}`,
+    );
+    return;
+  }
+
+  // Staged rather than appended straight onto the target: a chunk sequence
+  // that fails halfway would otherwise leave a truncated file where a
+  // readable one used to be. The target is replaced by a single mv at the
+  // end, so it is either the old content or the new one, never half of each.
+  const stagingPath = shellQuote(`${path}.exo-write.${Date.now()}`);
+  const decodedPath = shellQuote(`${path}.exo-decode.${Date.now()}`);
+  const cleanup = `rm -f ${stagingPath} ${decodedPath}`;
+
+  try {
+    await runWriteStep(execution, path, makeDirectory);
+    for (let offset = 0; offset < encoded.length; ) {
+      const chunk = encoded.slice(offset, offset + MAX_BASE64_PER_COMMAND);
+      // The first chunk truncates, the rest append, so a stale staging file
+      // from an interrupted earlier write cannot prepend itself to this one.
+      const redirect = offset === 0 ? ">" : ">>";
+      await runWriteStep(
+        execution,
+        path,
+        `printf %s ${shellQuote(chunk)} ${redirect} ${stagingPath}`,
+      );
+      offset += chunk.length;
+    }
+    await runWriteStep(
+      execution,
+      path,
+      `set -o pipefail && base64 -d < ${stagingPath} > ${decodedPath} && ` +
+        `mv -- ${decodedPath} ${quotedPath} && rm -f ${stagingPath}`,
+    );
+  } catch (error) {
+    // Best effort: the write already failed, and failing to tidy up must not
+    // replace that error with a less informative one.
+    await runShell(execution, cleanup).catch(() => {});
+    throw error;
+  }
+}
+
+async function runWriteStep(
+  execution: ToolExecutionContext,
+  path: string,
+  command: string,
+): Promise<void> {
   const outcome = await runShell(execution, command);
   if (outcome.exitCode !== 0) {
     throw new Error(
